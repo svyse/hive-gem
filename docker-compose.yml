@@ -1,0 +1,55 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      - WORKSPACE_ROOT=/app/.workspace
+      - MEMORY_DB_PATH=/app/.memory/memory.sqlite
+      # Local HF backend (default). Change to "openai" to use OpenAI.
+      - LLM_BACKEND=local
+      - LOCAL_LLM_MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      - LOCAL_LLM_ADAPTER_DIR=/app/.workspace/local_llm/adapters/latest
+      - HF_HOME=/app/.hf_cache
+      # Background training is optional; recommended to run the separate `trainer` service instead.
+      - LOCAL_TRAINING_ENABLED=false
+      - LOCAL_TRAINING_AUTOSTART=false
+    volumes:
+      - ./backend/.workspace:/app/.workspace
+      - ./backend/.memory:/app/.memory
+      - ./backend/.hf_cache:/app/.hf_cache
+      - ./:/repo:rw
+
+  # Optional: run LoRA fine-tuning in a separate container.
+  # Start it with: docker compose --profile trainer up --build
+  trainer:
+    profiles: ["trainer"]
+    build:
+      context: ./backend
+    command: ["python", "-m", "app.training.worker"]
+    environment:
+      - WORKSPACE_ROOT=/app/.workspace
+      - MEMORY_DB_PATH=/app/.memory/memory.sqlite
+      - LLM_BACKEND=local
+      - LOCAL_LLM_MODEL=TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      - LOCAL_LLM_ADAPTER_DIR=/app/.workspace/local_llm/adapters/latest
+      - HF_HOME=/app/.hf_cache
+      - LOCAL_TRAINING_ENABLED=true
+      - LOCAL_TRAINING_AUTOSTART=false
+    volumes:
+      - ./backend/.workspace:/app/.workspace
+      - ./backend/.memory:/app/.memory
+      - ./backend/.hf_cache:/app/.hf_cache
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      # Use the Vite dev server proxy so the browser calls /api/* on the same origin (5173)
+      # and Vite forwards to the backend container.
+      - VITE_PROXY_TARGET=http://backend:8000
+    depends_on:
+      - backend
