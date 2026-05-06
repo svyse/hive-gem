@@ -372,6 +372,12 @@ class Settings(BaseSettings):
     code_training_max_examples_per_run: int = Field(default=8, alias="CODE_TRAINING_MAX_EXAMPLES_PER_RUN")
     code_training_max_chars: int = Field(default=12000, alias="CODE_TRAINING_MAX_CHARS")
 
+    # User feedback / RLHF-style learning. Feedback is stored immediately and
+    # consumed by the manual local LoRA trainer with extra weight so corrections
+    # influence the local model more strongly than passive chat logs.
+    feedback_training_enabled: bool = Field(default=True, alias="FEEDBACK_TRAINING_ENABLED")
+    local_training_feedback_weight: int = Field(default=4, alias="LOCAL_TRAINING_FEEDBACK_WEIGHT")
+
     # ------------------------------
     # Agent spawn limits
     # ------------------------------

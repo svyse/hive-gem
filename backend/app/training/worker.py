@@ -64,6 +64,17 @@ def _include_upload_examples() -> bool:
     return bool(getattr(settings, "local_training_include_upload_examples", False))
 
 
+def _feedback_training_enabled() -> bool:
+    return bool(getattr(settings, "feedback_training_enabled", True))
+
+
+def _feedback_weight() -> int:
+    try:
+        return max(1, min(8, int(getattr(settings, "local_training_feedback_weight", 4) or 4)))
+    except Exception:
+        return 4
+
+
 def _looks_bad_training_text(text: Any) -> bool:
     lowered = str(text or "").strip().lower()
     if not lowered:
@@ -92,28 +103,38 @@ def _assistant_meta_excludes_training(meta_raw: Any) -> bool:
     return False
 
 
-def _current_db_max_ids() -> tuple[int, int]:
+def _current_db_max_ids() -> tuple[int, int, int]:
     db_path = Path(settings.memory_db_path).expanduser()
     if not db_path.exists():
-        return 0, 0
+        return 0, 0, 0
     try:
         conn = sqlite3.connect(str(db_path), timeout=10.0)
         cur = conn.cursor()
         row1 = cur.execute("SELECT COALESCE(MAX(id), 0) FROM conversation_messages").fetchone()
         row2 = cur.execute("SELECT COALESCE(MAX(id), 0) FROM training_examples").fetchone()
+        try:
+            row3 = cur.execute("SELECT COALESCE(MAX(id), 0) FROM model_feedback").fetchone()
+        except sqlite3.OperationalError:
+            row3 = [0]
         conn.close()
-        return int((row1 or [0])[0] or 0), int((row2 or [0])[0] or 0)
+        return (
+            int((row1 or [0])[0] or 0),
+            int((row2 or [0])[0] or 0),
+            int((row3 or [0])[0] or 0),
+        )
     except Exception:
-        return 0, 0
+        return 0, 0, 0
 
 
-def _normalize_state_ids(last_message_id: int, last_example_id: int) -> tuple[int, int]:
-    max_msg, max_ex = _current_db_max_ids()
+def _normalize_state_ids(last_message_id: int, last_example_id: int, last_feedback_id: int = 0) -> tuple[int, int, int]:
+    max_msg, max_ex, max_fb = _current_db_max_ids()
     if int(last_message_id or 0) > max_msg:
         last_message_id = 0
     if int(last_example_id or 0) > max_ex:
         last_example_id = 0
-    return int(last_message_id or 0), int(last_example_id or 0)
+    if int(last_feedback_id or 0) > max_fb:
+        last_feedback_id = 0
+    return int(last_message_id or 0), int(last_example_id or 0), int(last_feedback_id or 0)
 
 
 def _now_iso() -> str:
@@ -150,19 +171,20 @@ def _load_training_state_payload() -> Dict[str, Any]:
 
 
 
-def _load_training_state() -> tuple[int, int]:
-    """Return (last_message_id, last_training_example_id)."""
+def _load_training_state() -> tuple[int, int, int]:
+    """Return (last_message_id, last_training_example_id, last_feedback_id)."""
 
     data = _load_training_state_payload()
     try:
         last_msg = int(data.get("last_message_id") or 0)
         last_ex = int(data.get("last_training_example_id") or 0)
-        return _normalize_state_ids(last_msg, last_ex)
+        last_fb = int(data.get("last_feedback_id") or 0)
+        return _normalize_state_ids(last_msg, last_ex, last_fb)
     except Exception:
-        return 0, 0
+        return 0, 0, 0
 
 
-def _write_state(*, last_message_id: int, last_training_example_id: int, stats: Dict[str, Any]) -> None:
+def _write_state(*, last_message_id: int, last_training_example_id: int, last_feedback_id: int, stats: Dict[str, Any]) -> None:
     p = _training_state_file()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -171,6 +193,7 @@ def _write_state(*, last_message_id: int, last_training_example_id: int, stats: 
                 {
                     "last_message_id": int(last_message_id),
                     "last_training_example_id": int(last_training_example_id),
+                    "last_feedback_id": int(last_feedback_id),
                     "updated_at": _now_iso(),
                     "stats": stats,
                 },
@@ -269,11 +292,12 @@ def _has_peft() -> bool:
         return False
 
 
-def _count_new_items(last_message_id: int, last_example_id: int) -> int:
+def _count_new_items(last_message_id: int, last_example_id: int, last_feedback_id: int = 0) -> int:
     """Count new training signals since the last state.
 
     - assistant messages from conversations
-    - rows from training_examples (e.g., from uploads)
+    - rows from training_examples (uploads are opt-in)
+    - model_feedback rows with corrections or positive reward
     """
 
     db_path = Path(settings.memory_db_path).expanduser()
@@ -281,7 +305,9 @@ def _count_new_items(last_message_id: int, last_example_id: int) -> int:
         return 0
 
     try:
-        last_message_id, last_example_id = _normalize_state_ids(last_message_id, last_example_id)
+        last_message_id, last_example_id, last_feedback_id = _normalize_state_ids(
+            last_message_id, last_example_id, last_feedback_id
+        )
         conn = sqlite3.connect(str(db_path), timeout=10.0)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -307,10 +333,29 @@ def _count_new_items(last_message_id: int, last_example_id: int) -> int:
                 "SELECT COUNT(*) AS n FROM training_examples WHERE id > ? AND lower(COALESCE(source, '')) != 'upload'",
                 (int(last_example_id),),
             ).fetchone()
+        row3 = {"n": 0}
+        if _feedback_training_enabled():
+            try:
+                row3 = cur.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM model_feedback
+                    WHERE id > ?
+                      AND TRIM(COALESCE(prompt, '')) != ''
+                      AND (
+                        TRIM(COALESCE(corrected_response, '')) != ''
+                        OR (reward > 0 AND TRIM(COALESCE(response, '')) != '')
+                      )
+                    """,
+                    (int(last_feedback_id),),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row3 = {"n": 0}
         conn.close()
         n1 = int(row1["n"] if row1 else 0)
         n2 = int(row2["n"] if row2 else 0)
-        return n1 + n2
+        n3 = int(row3["n"] if row3 else 0)
+        return n1 + n2 + n3
     except Exception:
         return 0
 
@@ -472,6 +517,106 @@ def _load_recent_training_examples(*, max_pairs: int) -> Tuple[List[Tuple[str, s
         pairs = pairs[-max_pairs:]
 
     return pairs, max_ex_id
+
+
+
+
+def _load_recent_feedback_pairs(*, max_pairs: int) -> Tuple[List[Tuple[str, str]], int]:
+    """Load preferred (prompt, completion) pairs from explicit user feedback.
+
+    Corrections are preferred over original model responses. Positive feedback without
+    a correction uses the original model response. Negative-only feedback is retained
+    as a reward signal in the DB/hive memory, but is not used as a supervised target.
+    """
+
+    if not _feedback_training_enabled():
+        return [], 0
+
+    db_path = Path(settings.memory_db_path).expanduser()
+    if not db_path.exists():
+        return [], 0
+
+    limit_rows = max(200, int(max_pairs) * 3)
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    try:
+        rows = cur.execute(
+            """
+            SELECT id, target_type, prompt, response, corrected_response, comment, project_path, reward
+            FROM model_feedback
+            WHERE TRIM(COALESCE(prompt, '')) != ''
+              AND (
+                TRIM(COALESCE(corrected_response, '')) != ''
+                OR (reward > 0 AND TRIM(COALESCE(response, '')) != '')
+              )
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit_rows),),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return [], 0
+    conn.close()
+
+    if not rows:
+        return [], 0
+
+    rows = list(reversed(rows))
+    pairs: List[Tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    max_feedback_id = 0
+
+    try:
+        from app.feedback.rl import training_prompt_for_feedback
+    except Exception:
+        training_prompt_for_feedback = None  # type: ignore[assignment]
+
+    for r in rows:
+        fb_id = int(r["id"])
+        target_type = str(r["target_type"] or "qa").strip().lower()
+        prompt = str(r["prompt"] or "").strip()
+        corrected = str(r["corrected_response"] or "").strip()
+        response = str(r["response"] or "").strip()
+        comment = str(r["comment"] or "").strip()
+        project_path = str(r["project_path"] or "").strip()
+        try:
+            reward = float(r["reward"] or 0.0)
+        except Exception:
+            reward = 0.0
+        completion = corrected or (response if reward > 0 else "")
+        if not prompt or not completion:
+            continue
+        if _looks_bad_training_text(prompt) or _looks_bad_training_text(completion):
+            continue
+        if len(prompt) > 8000 or len(completion) > 12000:
+            continue
+        if training_prompt_for_feedback is not None:
+            try:
+                prompt_for_training = training_prompt_for_feedback(
+                    target_type=target_type,
+                    prompt=prompt,
+                    comment=comment,
+                    project_path=project_path,
+                )
+            except Exception:
+                prompt_for_training = prompt
+        else:
+            prompt_for_training = prompt
+        if _looks_bad_training_text(prompt_for_training):
+            continue
+        key = _pair_key(prompt_for_training, completion)
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append((prompt_for_training, completion))
+        max_feedback_id = max(max_feedback_id, fb_id)
+
+    if len(pairs) > max_pairs:
+        pairs = pairs[-max_pairs:]
+
+    return pairs, max_feedback_id
 
 
 
@@ -748,10 +893,10 @@ def main() -> int:
         return 2
 
     state = _load_training_state_payload()
-    last_msg_id, last_ex_id = _load_training_state()
-    last_msg_id, last_ex_id = _normalize_state_ids(last_msg_id, last_ex_id)
+    last_msg_id, last_ex_id, last_fb_id = _load_training_state()
+    last_msg_id, last_ex_id, last_fb_id = _normalize_state_ids(last_msg_id, last_ex_id, last_fb_id)
     min_new = max(1, int(getattr(settings, "local_training_min_new_pairs", 25) or 25))
-    n_new = _count_new_items(last_msg_id, last_ex_id)
+    n_new = _count_new_items(last_msg_id, last_ex_id, last_fb_id)
 
     previous_pairs_used = 0
     previous_base_pairs_used = 0
@@ -772,8 +917,13 @@ def main() -> int:
     max_pairs = max(50, int(getattr(settings, "local_training_max_pairs", 1500) or 1500))
     conv_pairs, max_assistant_id = _load_recent_conversation_pairs(max_pairs=max_pairs)
     ex_pairs, max_example_id = _load_recent_training_examples(max_pairs=max_pairs)
+    feedback_pairs, max_feedback_id = _load_recent_feedback_pairs(max_pairs=max_pairs)
+    feedback_weight = _feedback_weight() if feedback_pairs else 1
+    weighted_feedback_pairs: List[Tuple[str, str]] = []
+    for pair in feedback_pairs:
+        weighted_feedback_pairs.extend([pair] * feedback_weight)
 
-    all_pairs = conv_pairs + ex_pairs
+    all_pairs = conv_pairs + ex_pairs + weighted_feedback_pairs
     if len(all_pairs) > max_pairs:
         all_pairs = all_pairs[-max_pairs:]
 
@@ -820,8 +970,29 @@ def main() -> int:
     use_cuda = device.startswith("cuda") and torch.cuda.is_available()
     model_id = getattr(settings, "local_training_model", None) or settings.local_llm_model
 
+    if use_cuda:
+        try:
+            idx = _cuda_index(device)
+            props = torch.cuda.get_device_properties(idx)
+            torch.cuda.set_device(idx)
+            log.info(
+                "Local training CUDA selected: %s | %s | total_vram=%s MiB",
+                device,
+                getattr(props, "name", "CUDA GPU"),
+                int(getattr(props, "total_memory", 0) or 0) // (1024 * 1024),
+            )
+        except Exception as e:
+            log.warning("Training CUDA was selected but diagnostics/setup failed for %s: %s", device, e)
+    else:
+        log.warning(
+            "Local training will run on CPU (configured=%s, resolved=%s, cuda_available=%s).",
+            getattr(settings, "local_training_device", "auto"),
+            device,
+            bool(torch.cuda.is_available()),
+        )
+
     log.info(
-        "Training local LoRA adapter | model=%s | device=%s | weighted_pairs=%s | base_window=%s | A=%s | B=%s | C=%s | recent_pairs=%s (conv=%s, extra=%s, include_upload_examples=%s, new_items=%s, previous_pairs_used=%s, previous_base_pairs_used=%s)",
+        "Training local LoRA adapter | model=%s | device=%s | weighted_pairs=%s | base_window=%s | A=%s | B=%s | C=%s | recent_pairs=%s (conv=%s, extra=%s, feedback_raw=%s, feedback_weight=%s, include_upload_examples=%s, new_items=%s, previous_pairs_used=%s, previous_base_pairs_used=%s)",
         model_id,
         device,
         len(pairs),
@@ -832,6 +1003,8 @@ def main() -> int:
         len(all_pairs),
         len(conv_pairs),
         len(ex_pairs),
+        len(feedback_pairs),
+        feedback_weight,
         _include_upload_examples(),
         n_new,
         previous_pairs_used,
@@ -1231,6 +1404,9 @@ def main() -> int:
         "pairs_used": len(pairs),
         "pairs_used_conv": len(conv_pairs),
         "pairs_used_extra": len(ex_pairs),
+        "pairs_used_feedback_raw": len(feedback_pairs),
+        "feedback_weight": feedback_weight,
+        "feedback_training_enabled": _feedback_training_enabled(),
         "include_upload_examples": _include_upload_examples(),
         "new_items_since_last": n_new,
         "rolling_window_pairs": len(pairs),
@@ -1246,8 +1422,14 @@ def main() -> int:
         "max_steps": max_steps,
         "learning_rate": lr,
         "adapter_run_dir": str(run_dir),
+        "max_feedback_id": max_feedback_id or last_fb_id,
     }
-    _write_state(last_message_id=max_assistant_id or last_msg_id, last_training_example_id=max_example_id or last_ex_id, stats=train_stats)
+    _write_state(
+        last_message_id=max_assistant_id or last_msg_id,
+        last_training_example_id=max_example_id or last_ex_id,
+        last_feedback_id=max_feedback_id or last_fb_id,
+        stats=train_stats,
+    )
     log.info("Training complete. Updated adapter in %s", latest)
     return 0
 

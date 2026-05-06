@@ -207,6 +207,36 @@ class MemoryStore:
                 "CREATE INDEX IF NOT EXISTS idx_speech_repl_mode_count ON speech_replacements(mode, count DESC);"
             )
 
+            # --- model response feedback / RLHF reward signals ---
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS model_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_type TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    conversation_id TEXT,
+                    run_id TEXT,
+                    score INTEGER NOT NULL DEFAULT 0,
+                    reward REAL NOT NULL DEFAULT 0.0,
+                    prompt TEXT,
+                    response TEXT,
+                    corrected_response TEXT,
+                    comment TEXT,
+                    backend TEXT,
+                    project_path TEXT,
+                    mode TEXT,
+                    input_mode TEXT,
+                    meta TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_target ON model_feedback(target_type, target_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_conv ON model_feedback(conversation_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_run ON model_feedback(run_id);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_score ON model_feedback(score, reward);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_feedback_created ON model_feedback(created_at);")
+
             self._conn.commit()
 
     # ---------------------------------------------------------------------
@@ -1046,6 +1076,171 @@ class MemoryStore:
                 }
             )
         return out
+
+
+    # ---------------------------------------------------------------------
+    # Model feedback / RLHF reward signals
+    # ---------------------------------------------------------------------
+
+    def add_model_feedback(
+        self,
+        *,
+        target_type: str,
+        target_id: str,
+        score: int,
+        reward: float,
+        created_at: str,
+        conversation_id: Optional[str] = None,
+        run_id: Optional[str] = None,
+        prompt: Optional[str] = None,
+        response: Optional[str] = None,
+        corrected_response: Optional[str] = None,
+        comment: Optional[str] = None,
+        backend: Optional[str] = None,
+        project_path: Optional[str] = None,
+        mode: Optional[str] = None,
+        input_mode: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        meta_json = json.dumps(meta or {}, ensure_ascii=False)
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO model_feedback(
+                    target_type, target_id, conversation_id, run_id, score, reward,
+                    prompt, response, corrected_response, comment, backend, project_path,
+                    mode, input_mode, meta, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(target_type or ""),
+                    str(target_id or ""),
+                    None if conversation_id is None else str(conversation_id),
+                    None if run_id is None else str(run_id),
+                    int(score),
+                    float(reward),
+                    None if prompt is None else str(prompt),
+                    None if response is None else str(response),
+                    None if corrected_response is None else str(corrected_response),
+                    None if comment is None else str(comment),
+                    None if backend is None else str(backend),
+                    None if project_path is None else str(project_path),
+                    None if mode is None else str(mode),
+                    None if input_mode is None else str(input_mode),
+                    meta_json,
+                    str(created_at),
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def _feedback_row_to_dict(self, r: sqlite3.Row) -> Dict[str, Any]:
+        try:
+            meta = json.loads(r["meta"] or "{}")
+            if not isinstance(meta, dict):
+                meta = {"value": meta}
+        except Exception:
+            meta = {}
+        return {
+            "id": int(r["id"]),
+            "target_type": r["target_type"],
+            "target_id": r["target_id"],
+            "conversation_id": r["conversation_id"],
+            "run_id": r["run_id"],
+            "score": int(r["score"] or 0),
+            "reward": float(r["reward"] or 0.0),
+            "prompt": r["prompt"],
+            "response": r["response"],
+            "corrected_response": r["corrected_response"],
+            "comment": r["comment"],
+            "backend": r["backend"],
+            "project_path": r["project_path"],
+            "mode": r["mode"],
+            "input_mode": r["input_mode"],
+            "meta": meta,
+            "created_at": r["created_at"],
+        }
+
+    def list_model_feedback(
+        self,
+        *,
+        limit: int = 50,
+        target_type: Optional[str] = None,
+        target_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if target_type:
+            clauses.append("target_type = ?")
+            params.append(str(target_type))
+        if target_id:
+            clauses.append("target_id = ?")
+            params.append(str(target_id))
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        sql = f"SELECT * FROM model_feedback{where} ORDER BY id DESC LIMIT ?"
+        params.append(int(max(1, min(int(limit or 50), 500))))
+        with self._lock:
+            cur = self._conn.cursor()
+            rows = cur.execute(sql, params).fetchall()
+        return [self._feedback_row_to_dict(r) for r in rows]
+
+    def model_feedback_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            cur = self._conn.cursor()
+            total = cur.execute("SELECT COUNT(*) AS n FROM model_feedback").fetchone()
+            pos = cur.execute("SELECT COUNT(*) AS n FROM model_feedback WHERE reward > 0").fetchone()
+            neg = cur.execute("SELECT COUNT(*) AS n FROM model_feedback WHERE reward < 0").fetchone()
+            corrections = cur.execute(
+                "SELECT COUNT(*) AS n FROM model_feedback WHERE TRIM(COALESCE(corrected_response, '')) != ''"
+            ).fetchone()
+            by_backend = cur.execute(
+                """
+                SELECT COALESCE(NULLIF(backend, ''), 'unknown') AS backend, COUNT(*) AS n
+                FROM model_feedback
+                GROUP BY COALESCE(NULLIF(backend, ''), 'unknown')
+                ORDER BY n DESC
+                """
+            ).fetchall()
+            by_target = cur.execute(
+                """
+                SELECT target_type, COUNT(*) AS n
+                FROM model_feedback
+                GROUP BY target_type
+                ORDER BY n DESC
+                """
+            ).fetchall()
+            max_id = cur.execute("SELECT COALESCE(MAX(id), 0) AS n FROM model_feedback").fetchone()
+        return {
+            "total": int(total["n"] if total else 0),
+            "positive": int(pos["n"] if pos else 0),
+            "negative": int(neg["n"] if neg else 0),
+            "corrections": int(corrections["n"] if corrections else 0),
+            "max_id": int(max_id["n"] if max_id else 0),
+            "by_backend": {str(r["backend"]): int(r["n"] or 0) for r in by_backend},
+            "by_target_type": {str(r["target_type"]): int(r["n"] or 0) for r in by_target},
+        }
+
+    def recent_model_feedback_training_pairs(self, *, limit: int = 200, since_id: int = 0) -> List[Dict[str, Any]]:
+        """Return feedback rows that can become supervised preference/correction examples."""
+        with self._lock:
+            cur = self._conn.cursor()
+            rows = cur.execute(
+                """
+                SELECT *
+                FROM model_feedback
+                WHERE id > ?
+                  AND TRIM(COALESCE(prompt, '')) != ''
+                  AND (
+                    TRIM(COALESCE(corrected_response, '')) != ''
+                    OR (reward > 0 AND TRIM(COALESCE(response, '')) != '')
+                  )
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(since_id), int(max(1, min(int(limit or 200), 1000)))),
+            ).fetchall()
+        return [self._feedback_row_to_dict(r) for r in rows]
 
 
 _STORE: Optional[MemoryStore] = None

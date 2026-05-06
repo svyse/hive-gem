@@ -14,6 +14,7 @@ from app.runtime.workspace import Workspace, create_workspace
 from app.runtime.bus import MessageBus
 from app.agents.registry import AgentRegistry
 from app.memory.store import get_memory_store
+from app.llm.factory import use_llm_backend
 
 
 def _now_iso() -> str:
@@ -32,7 +33,9 @@ class RunRecord:
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     task: Optional[asyncio.Task] = None
+    prompt: str = ""
     input_mode: str = "text"
+    llm_backend: str = ""
 
 
 class RunManager:
@@ -40,7 +43,7 @@ class RunManager:
         self._runs: Dict[str, RunRecord] = {}
         self._lock = asyncio.Lock()
 
-    async def start_run(self, project_path: str, prompt: str, copy_project_to_workspace: bool, input_mode: str = "text") -> str:
+    async def start_run(self, project_path: str, prompt: str, copy_project_to_workspace: bool, input_mode: str = "text", llm_backend: str | None = None) -> str:
         run_id = uuid.uuid4().hex[:12]
 
         ws = create_workspace(run_id, project_path, copy_project_to_workspace)
@@ -51,7 +54,9 @@ class RunManager:
             updated_at=_now_iso(),
             status="running",
             project_root=str(ws.project_root),
+            prompt=prompt or "",
             input_mode=input_mode or "text",
+            llm_backend=llm_backend or "",
         )
 
         async with self._lock:
@@ -73,16 +78,21 @@ class RunManager:
             pass
 
         run_logger = self._make_logger(run_id, bus)
-        registry = AgentRegistry(
-            bus=bus,
-            memory_store=memory,
-            run_id=run_id,
-            run_logger=run_logger,
-            status_reporter=lambda st: self.update_agent_status(run_id, st),
-        )
+        # Build the registry and background task inside the request backend
+        # context so this run can use the dashboard-selected provider even if
+        # the global switch-status endpoint was delayed by a busy local runtime.
+        with use_llm_backend(llm_backend):
+            registry = AgentRegistry(
+                bus=bus,
+                memory_store=memory,
+                run_id=run_id,
+                run_logger=run_logger,
+                status_reporter=lambda st: self.update_agent_status(run_id, st),
+            )
 
-        # Start orchestrator pipeline as a background task (within the server process).
-        record.task = asyncio.create_task(self._run_pipeline(record, ws, prompt, registry))
+            # Start orchestrator pipeline as a background task (within the server process).
+            # asyncio.create_task copies ContextVars on Python 3.11+, preserving llm_backend.
+            record.task = asyncio.create_task(self._run_pipeline(record, ws, prompt, registry))
         return run_id
 
     def _make_logger(self, run_id: str, bus: MessageBus):
@@ -165,6 +175,8 @@ class RunManager:
             created_at=rec.created_at,
             updated_at=rec.updated_at,
             project_root=rec.project_root,
+            prompt=rec.prompt,
+            input_mode=rec.input_mode,
             logs=rec.logs,
             agent_statuses=list(rec.agent_statuses.values()),
             result=rec.result,

@@ -9,6 +9,7 @@ class RunCreateRequest(BaseModel):
     prompt: str = Field(..., description="Natural language prompt describing desired feature/change.")
     copy_project_to_workspace: bool = Field(False, description="If true, operate on a workspace copy of non-sample projects. sample_projects are always edited in place.")
     input_mode: str = Field("text", description="How the prompt was provided: text|voice")
+    backend: Optional[str] = Field(None, description="Optional per-request LLM backend override: local|openai|gemini")
 
 
 class RunCreateResponse(BaseModel):
@@ -42,6 +43,8 @@ class RunStatusResponse(BaseModel):
     created_at: str
     updated_at: str
     project_root: str
+    prompt: Optional[str] = None
+    input_mode: Optional[str] = None
     logs: List[str]
     agent_statuses: List[AgentStatus]
     result: Optional[Dict[str, Any]] = None
@@ -124,6 +127,7 @@ class QAAskRequest(BaseModel):
     use_web: bool = Field(True, description="If true, allow web research agents to retrieve sources.")
     use_local_refs: bool = Field(True, description="If true, allow local-reference agent to search local projects.")
     input_mode: str = Field("text", description="How the question was provided: text|voice")
+    backend: Optional[str] = Field(None, description="Optional per-request LLM backend override: local|openai|gemini")
 
     # Multi-turn conversation support
     conversation_id: Optional[str] = Field(
@@ -170,6 +174,53 @@ class QAConversationGetResponse(BaseModel):
 
 class QAConversationListResponse(BaseModel):
     conversations: List[Dict[str, Any]]
+
+
+
+
+# ------------------------------
+# Model feedback / RLHF schemas
+# ------------------------------
+
+
+class ModelFeedbackRequest(BaseModel):
+    target_type: str = Field(..., description="Feedback target: qa or code")
+    target_id: Optional[str] = Field(None, description="Q&A turn id or code run id")
+    conversation_id: Optional[str] = Field(None, description="Conversation id for Q&A feedback")
+    run_id: Optional[str] = Field(None, description="Run id for code-pipeline feedback")
+    score: int = Field(..., ge=-1, le=1, description="-1=bad, 0=neutral/correction-only, 1=good")
+    prompt: Optional[str] = Field(None, description="Original user prompt/question")
+    response: Optional[str] = Field(None, description="Model response being rated")
+    corrected_response: Optional[str] = Field(None, description="Preferred corrected answer/patch supplied by the user")
+    comment: Optional[str] = Field(None, description="Optional user feedback notes")
+    backend: Optional[str] = Field(None, description="Backend that produced the response: local|gemini|openai")
+    project_path: Optional[str] = Field(None, description="Project/sample_projects path, if relevant")
+    mode: Optional[str] = Field(None, description="UI mode: qa|code")
+    input_mode: Optional[str] = Field(None, description="Prompt input mode: text|voice")
+    add_to_training: bool = Field(True, description="If true, positive/corrected responses are added to manual trainer data")
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ModelFeedbackResponse(BaseModel):
+    feedback_id: int
+    reward: float
+    memory_id: Optional[int] = None
+    training_example_id: Optional[int] = None
+    message: str
+
+
+class ModelFeedbackListResponse(BaseModel):
+    feedback: List[Dict[str, Any]]
+
+
+class ModelFeedbackStatsResponse(BaseModel):
+    total: int = 0
+    positive: int = 0
+    negative: int = 0
+    corrections: int = 0
+    max_id: int = 0
+    by_backend: Dict[str, int] = Field(default_factory=dict)
+    by_target_type: Dict[str, int] = Field(default_factory=dict)
 
 
 # ------------------------------

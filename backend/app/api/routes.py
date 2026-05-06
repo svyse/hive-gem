@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import uuid
 import traceback
+import logging
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Any, Dict
 import asyncio
 
 from fastapi import APIRouter, HTTPException, Query, UploadFile, File
@@ -17,6 +18,10 @@ from app.api.schemas import (
     MemorySearchResponse,
     ModelBackendSetRequest,
     ModelBackendStatusResponse,
+    ModelFeedbackStatsResponse,
+    ModelFeedbackListResponse,
+    ModelFeedbackResponse,
+    ModelFeedbackRequest,
     QAAskRequest,
     QAAskResponse,
     QAConversationCreateRequest,
@@ -45,11 +50,13 @@ from app.speech.formatting import format_transcript, extract_replacements
 from app.runtime.qa_runner import run_qa
 from app.runtime.run_manager import get_run_manager
 from app.uploads.ingest import ingest_upload
+from app.feedback.rl import resolve_qa_context, submit_feedback
 from app.workspace_modules.manager import WorkspaceModuleManager
 from app.workspace_modules.builtin import ensure_builtin_modules
-from app.llm.factory import get_backend_status, set_active_backend
+from app.llm.factory import get_backend_status, get_local_runtime_status, set_active_backend, use_llm_backend
 
 router = APIRouter()
+log = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -73,12 +80,123 @@ def get_model_backend():
 
 @router.post("/model/backend", response_model=ModelBackendStatusResponse)
 def set_model_backend(req: ModelBackendSetRequest):
+    requested = str(req.backend or "").strip().lower()
+    log.info("Model backend switch request received: %s", requested)
     try:
-        return set_active_backend(req.backend)
+        status = set_active_backend(requested)
+        log.info("Model backend switch request completed: active=%s", status.get("active_backend"))
+        return status
     except ValueError as e:
+        log.warning("Model backend switch rejected: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        log.exception("Model backend switch failed")
         raise HTTPException(status_code=500, detail=f"Failed to switch backend: {type(e).__name__}: {e}")
+
+
+@router.get("/local/status")
+def local_runtime_status(deep: bool = Query(False, description="If true, import torch and probe CUDA. Default is shallow/non-blocking.")) -> Dict[str, Any]:
+    """Report local LLM/trainer status. Shallow by default; deep probes CUDA."""
+    return get_local_runtime_status(deep=bool(deep))
+
+
+# ------------------------------
+# Model feedback / RLHF reward signals
+# ------------------------------
+
+
+@router.post("/feedback", response_model=ModelFeedbackResponse)
+async def submit_model_feedback(req: ModelFeedbackRequest):
+    """Store user feedback from Q&A or code-pipeline responses.
+
+    Positive/corrected feedback is also queued for the manual local LoRA/RLHF-style
+    trainer. Negative feedback is stored as a reward signal and hive memory; if the
+    user supplies a corrected response, that corrected response becomes the preferred
+    training target.
+    """
+    store = get_memory_store()
+    target_type = (req.target_type or "qa").strip().lower()
+    if target_type not in {"qa", "code"}:
+        raise HTTPException(status_code=400, detail="target_type must be 'qa' or 'code'")
+
+    target_id = (req.target_id or req.run_id or "").strip()
+    prompt = req.prompt or ""
+    response = req.response or ""
+    project_path = req.project_path or ""
+    input_mode = req.input_mode or ""
+    meta = dict(req.meta or {})
+
+    # Best-effort recovery when the frontend only sends ids.
+    if target_type == "qa" and req.conversation_id and target_id and (not prompt or not response):
+        ctx = resolve_qa_context(store, conversation_id=req.conversation_id, turn_id=target_id)
+        prompt = prompt or str(ctx.get("prompt") or "")
+        response = response or str(ctx.get("response") or "")
+        project_path = project_path or str(ctx.get("project_path") or "")
+        input_mode = input_mode or str(ctx.get("input_mode") or "")
+        if ctx.get("orchestrator"):
+            meta.setdefault("orchestrator", ctx.get("orchestrator"))
+
+    if target_type == "code" and req.run_id and (not prompt or not response or not project_path or not input_mode):
+        status = get_run_manager().get_status(req.run_id)
+        if status is not None:
+            prompt = prompt or str(getattr(status, "prompt", "") or "")
+            input_mode = input_mode or str(getattr(status, "input_mode", "") or "")
+            if status.result:
+                prompt = prompt or str((status.result or {}).get("prompt") or "")
+                response = response or json.dumps(status.result, ensure_ascii=False, indent=2)
+                project_path = project_path or str((status.result or {}).get("project_root") or "")
+            else:
+                response = response or str(status.error or "")
+                if not response and status.logs:
+                    response = "\n".join((status.logs or [])[-120:])
+            project_path = project_path or str(status.project_root or "")
+
+    if not target_id:
+        target_id = req.run_id or req.conversation_id or f"feedback-{uuid.uuid4().hex[:12]}"
+
+    # Store feedback even if we cannot recover the original prompt. The feedback
+    # stats/reward signal should still update. The manual trainer will simply skip
+    # rows that lack a usable prompt.
+    if not str(prompt or "").strip():
+        meta.setdefault("warning", "original prompt was not available; feedback saved but not used as a supervised training pair")
+
+    result = submit_feedback(
+        store=store,
+        target_type=target_type,
+        target_id=target_id,
+        conversation_id=req.conversation_id,
+        run_id=req.run_id or (target_id if target_type == "code" else None),
+        score=int(req.score),
+        prompt=prompt,
+        response=response,
+        corrected_response=req.corrected_response or "",
+        comment=req.comment or "",
+        backend=req.backend or str(get_backend_status().get("active_backend") or ""),
+        project_path=project_path,
+        mode=req.mode or target_type,
+        input_mode=input_mode,
+        add_to_training=bool(req.add_to_training),
+        meta=meta,
+    )
+    return ModelFeedbackResponse(**result)
+
+
+@router.get("/feedback", response_model=ModelFeedbackListResponse)
+def list_model_feedback(
+    target_type: str | None = Query(None, description="Optional feedback target type: qa|code"),
+    target_id: str | None = Query(None, description="Optional Q&A turn id or run id"),
+    limit: int = Query(50, ge=1, le=500),
+):
+    store = get_memory_store()
+    rows = store.list_model_feedback(limit=int(limit), target_type=target_type, target_id=target_id)
+    return ModelFeedbackListResponse(feedback=rows)
+
+
+@router.get("/feedback/stats", response_model=ModelFeedbackStatsResponse)
+def model_feedback_stats():
+    store = get_memory_store()
+    return ModelFeedbackStatsResponse(**store.model_feedback_stats())
+
 
 # ------------------------------
 # Uploads (documents/images)
@@ -92,7 +210,7 @@ async def upload_file(
 ):
     """Upload a document or image and ingest it into the hive.
 
-    The backend extracts text (best-effort), chunks it into hive memory (so BOTH local HF and OpenAI
+    The backend extracts text (best-effort), chunks it into hive memory (so local HF, Gemini, and OpenAI
     can use it), and optionally creates SFT training examples for the background LoRA worker.
     """
     from app.core.config import settings
@@ -285,6 +403,7 @@ async def create_run(req: RunCreateRequest):
         prompt=req.prompt,
         copy_project_to_workspace=req.copy_project_to_workspace,
         input_mode=req.input_mode,
+        llm_backend=getattr(req, "backend", None),
     )
     return RunCreateResponse(run_id=run_id)
 
@@ -398,16 +517,17 @@ async def qa_ask(req: QAAskRequest):
     # we return a *structured* response instead of a 500. This prevents the
     # frontend from showing an empty window / "unable to fetch".
     try:
-        qa_res = await run_qa(
-            question=req.question,
-            orchestrator=req.orchestrator,
-            project_path=req.project_path,
-            use_web=req.use_web,
-            use_local_refs=req.use_local_refs,
-            input_mode=req.input_mode,
-            conversation_id=req.conversation_id,
-            conversation_title=req.conversation_title,
-        )
+        with use_llm_backend(getattr(req, "backend", None)):
+            qa_res = await run_qa(
+                question=req.question,
+                orchestrator=req.orchestrator,
+                project_path=req.project_path,
+                use_web=req.use_web,
+                use_local_refs=req.use_local_refs,
+                input_mode=req.input_mode,
+                conversation_id=req.conversation_id,
+                conversation_title=req.conversation_title,
+            )
         answer_text = str((qa_res.result or {}).get("answer", ""))
         return QAAskResponse(
             run_id=qa_res.turn_id,

@@ -612,17 +612,23 @@ export default function PromptPanel({
             <select
               value={llmBackend || 'local'}
               onChange={(e) => onLlmBackendChange?.(e.target.value)}
-              disabled={disabled || modelSwitching}
+              disabled={false}
             >
               <option value="local">Local</option>
               <option value="gemini">Gemini</option>
               <option value="openai">OpenAI</option>
             </select>
             <div className="small" style={{ marginTop: 6 }}>
-              Active: <b>{llmBackend || 'local'}</b>
-              {modelSwitching ? ' • switching...' : ''}
+              Selected: <b>{llmBackend || 'local'}</b>
+              {modelSwitching ? ' • syncing server default...' : ''}
               {llmStatus?.models?.[llmBackend] ? ` • ${llmStatus.models[llmBackend]}` : ''}
+              {llmStatus?.active_backend && llmStatus.active_backend !== llmBackend ? ` • server default: ${llmStatus.active_backend}` : ''}
             </div>
+            {(llmBackend || 'local') === 'local' ? (
+              <div className="small" style={{ marginTop: 4, opacity: 0.75 }}>
+                Local loads lazily only when selected. Gemini/OpenAI selection routes new requests directly even if the server default sync is delayed.
+              </div>
+            ) : null}
             {modelSwitchError ? (
               <div className="small" style={{ marginTop: 6 }}>
                 <b>Model switch error:</b> {modelSwitchError}

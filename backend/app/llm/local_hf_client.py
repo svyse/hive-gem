@@ -161,6 +161,65 @@ class LocalHFClient:
         # We only return False if we already tried loading and failed.
         return self._load_error is None
 
+    def runtime_status(self) -> Dict[str, Any]:
+        """Return local model/GPU status for the dashboard and diagnostics."""
+        info: Dict[str, Any] = {
+            "backend": "local",
+            "model_id": self.model_id,
+            "configured_device": self.device,
+            "resolved_device": self._device,
+            "loaded": self._model is not None and self._tokenizer is not None,
+            "load_error": self._load_error,
+            "bitsandbytes_available": _has_bitsandbytes(),
+            "peft_available": _has_peft(),
+            "adapter_path": str(self._adapter_path()),
+            "adapter_loaded_mtime": self._adapter_mtime,
+        }
+
+        try:
+            import torch
+
+            info["cuda_available"] = bool(torch.cuda.is_available())
+            info["cuda_device_count"] = int(torch.cuda.device_count() if torch.cuda.is_available() else 0)
+            devices: List[Dict[str, Any]] = []
+            if torch.cuda.is_available():
+                for i in range(int(torch.cuda.device_count())):
+                    try:
+                        props = torch.cuda.get_device_properties(i)
+                        total_mb = int(getattr(props, "total_memory", 0) or 0) // (1024 * 1024)
+                        devices.append(
+                            {
+                                "index": i,
+                                "name": str(getattr(props, "name", f"cuda:{i}")),
+                                "total_memory_mb": total_mb,
+                                "allocated_mb": int(torch.cuda.memory_allocated(i)) // (1024 * 1024),
+                                "reserved_mb": int(torch.cuda.memory_reserved(i)) // (1024 * 1024),
+                            }
+                        )
+                    except Exception as e:
+                        devices.append({"index": i, "error": str(e)})
+            info["cuda_devices"] = devices
+            try:
+                info["cuda_current_device"] = int(torch.cuda.current_device()) if torch.cuda.is_available() else None
+            except Exception:
+                info["cuda_current_device"] = None
+        except Exception as e:
+            info["cuda_available"] = False
+            info["torch_error"] = str(e)
+
+        if self._model is not None:
+            try:
+                info["hf_device_map"] = getattr(self._model, "hf_device_map", None)
+            except Exception:
+                info["hf_device_map"] = None
+            try:
+                first_param = next(self._model.parameters())
+                info["first_parameter_device"] = str(first_param.device)
+                info["first_parameter_dtype"] = str(first_param.dtype).replace("torch.", "")
+            except Exception as e:
+                info["first_parameter_error"] = str(e)
+        return info
+
     # ------------------------------
     # Loading
     # ------------------------------
@@ -186,9 +245,25 @@ class LocalHFClient:
 
             if use_cuda:
                 try:
+                    idx = int(self._device.split(":", 1)[1]) if ":" in self._device else int(torch.cuda.current_device())
+                    props = torch.cuda.get_device_properties(idx)
+                    log.info(
+                        "Local CUDA selected: %s | %s | total_vram=%s MiB",
+                        self._device,
+                        getattr(props, "name", "CUDA GPU"),
+                        int(getattr(props, "total_memory", 0) or 0) // (1024 * 1024),
+                    )
+                    torch.cuda.set_device(idx)
                     torch.cuda.empty_cache()
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning("CUDA was selected but diagnostics/setup failed for %s: %s", self._device, e)
+            else:
+                log.warning(
+                    "Local model will run on CPU (configured=%s, resolved=%s, cuda_available=%s).",
+                    self.device,
+                    self._device,
+                    bool(torch.cuda.is_available()),
+                )
 
             log.info("Loading local model: %s (device=%s)", model_id, self._device)
 
@@ -303,6 +378,18 @@ class LocalHFClient:
 
             self._tokenizer = tok
             self._model = model
+
+            try:
+                first_param = next(model.parameters())
+                log.info(
+                    "Local model loaded: model=%s | device_map=%s | first_parameter_device=%s | dtype=%s",
+                    model_id,
+                    getattr(model, "hf_device_map", None),
+                    str(first_param.device),
+                    str(first_param.dtype).replace("torch.", ""),
+                )
+            except Exception:
+                log.info("Local model loaded: model=%s | device_map=%s", model_id, getattr(model, "hf_device_map", None))
 
             # Optional LoRA adapter
             self._maybe_load_adapter(force=True)
@@ -667,19 +754,7 @@ class LocalHFClient:
             return self._repair_json_output(system=system, messages=messages, raw_text=text)
 
     def _async_timeout(self, timeout_s: Optional[float]) -> float:
-        t = float(
-            timeout_s
-            or getattr(settings, "local_llm_timeout_s", None)
-            or getattr(settings, "llm_timeout_s", 60.0)
-            or 60.0
-        )
-        # Cold-starting a local HF model on CPU can take noticeably longer than a hot request.
-        # Avoid tripping provider fallback during the initial model download/load.
-        if self._model is None or self._tokenizer is None:
-            if str(self._device).strip().lower() == "cpu":
-                return max(t, 180.0)
-            return max(t, 90.0)
-        return t
+        return self._effective_timeout(timeout_s)
 
     async def chat_text_async(
         self,
