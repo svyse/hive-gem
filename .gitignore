@@ -1,0 +1,6 @@
+.memory
+.workspace
+backend/.my_rl_venv
+backend/.env
+frontend/node_modules
+sample_projects

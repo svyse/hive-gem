@@ -1,0 +1,30 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+pydantic-settings>=2.0.0
+
+# Web research utilities
+httpx>=0.27.0
+beautifulsoup4>=4.12.0
+
+# LLM backends
+# torch==2.0.0
+# torchvision==0.15.1
+# torchaudio==2.0.1
+transformers==4.41.0
+accelerate==0.33.0
+
+# Optional: OpenAI backend (only used if LLM_BACKEND=openai)
+openai>=1.30.0
+
+# Local fine-tuning (LoRA)
+peft==0.11.1
+datasets==2.20.0
+sentencepiece>=0.2.0
+safetensors>=0.4.0
+bitsandbytes>=0.43.0; platform_system != "Windows"
+
+# Uploads (documents/images)
+python-multipart
+pypdf
+python-docx
+pillow
