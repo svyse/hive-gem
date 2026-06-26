@@ -14,6 +14,7 @@ from app.runtime.workspace import Workspace, create_workspace
 from app.runtime.bus import MessageBus
 from app.agents.registry import AgentRegistry
 from app.memory.store import get_memory_store
+from app.llm.factory import use_llm_backend, active_backend
 
 
 def _now_iso() -> str:
@@ -32,7 +33,9 @@ class RunRecord:
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     task: Optional[asyncio.Task] = None
+    prompt: str = ""
     input_mode: str = "text"
+    llm_backend: str = ""
 
 
 class RunManager:
@@ -40,10 +43,59 @@ class RunManager:
         self._runs: Dict[str, RunRecord] = {}
         self._lock = asyncio.Lock()
 
-    async def start_run(self, project_path: str, prompt: str, copy_project_to_workspace: bool, input_mode: str = "text") -> str:
+    async def start_run(
+        self,
+        project_path: str,
+        prompt: str,
+        copy_project_to_workspace: bool,
+        input_mode: str = "text",
+        llm_backend: str | None = None,
+        project_context_document: Optional[Dict[str, Any]] = None,
+    ) -> str:
         run_id = uuid.uuid4().hex[:12]
 
         ws = create_workspace(run_id, project_path, copy_project_to_workspace)
+
+        run_prompt = prompt or ""
+        doc_meta: Optional[Dict[str, Any]] = None
+        if project_context_document:
+            filename = str(project_context_document.get("filename") or "project-context-document")
+            content_type = str(project_context_document.get("content_type") or "")
+            size_bytes = int(project_context_document.get("size_bytes") or 0)
+            doc_text = str(project_context_document.get("text") or "")
+
+            context_dir = Path(ws.project_root) / ".hive_project_context"
+            context_dir.mkdir(parents=True, exist_ok=True)
+            text_path = context_dir / "uploaded_document_extracted.txt"
+            meta_path = context_dir / "uploaded_document_meta.json"
+            text_path.write_text(doc_text, encoding="utf-8")
+
+            doc_meta = {
+                "filename": filename,
+                "content_type": content_type,
+                "size_bytes": size_bytes,
+                "text_chars": len(doc_text),
+                "extracted_text_path": str(text_path),
+            }
+            meta_path.write_text(json.dumps(doc_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            excerpt = doc_text[:6000]
+            if len(doc_text) > len(excerpt):
+                excerpt += "\n\n[Document continues in .hive_project_context/uploaded_document_extracted.txt]"
+
+            run_prompt = (
+                f"{run_prompt.strip()}\n\n"
+                "---\n"
+                "UPLOADED PROJECT CONTEXT DOCUMENT (one-off for this code run; not a Hive memory upload):\n"
+                f"Filename: {filename}\n"
+                f"Content type: {content_type or 'unknown'}\n"
+                f"Extracted text path inside project: .hive_project_context/uploaded_document_extracted.txt\n"
+                "Use this document as source material/requirements when creating or modifying the project. "
+                "Do not implement a document-ingestion feature unless the user's prompt asks for that.\n\n"
+                "Document excerpt:\n"
+                f"{excerpt}\n"
+                "---"
+            ).strip()
 
         record = RunRecord(
             run_id=run_id,
@@ -51,7 +103,9 @@ class RunManager:
             updated_at=_now_iso(),
             status="running",
             project_root=str(ws.project_root),
+            prompt=prompt or "",
             input_mode=input_mode or "text",
+            llm_backend=llm_backend or "",
         )
 
         async with self._lock:
@@ -64,8 +118,14 @@ class RunManager:
         try:
             memory.add(
                 scope="hive",
-                content=json.dumps({"event": "run_prompt", "run_id": run_id, "prompt": prompt, "input_mode": record.input_mode}),
-                tags=["prompt", record.input_mode],
+                content=json.dumps({
+                    "event": "run_prompt",
+                    "run_id": run_id,
+                    "prompt": prompt,
+                    "input_mode": record.input_mode,
+                    "project_context_document": doc_meta,
+                }),
+                tags=["prompt", record.input_mode] + (["project_context_document"] if doc_meta else []),
                 success=None,
                 created_at=_now_iso(),
             )
@@ -73,16 +133,21 @@ class RunManager:
             pass
 
         run_logger = self._make_logger(run_id, bus)
-        registry = AgentRegistry(
-            bus=bus,
-            memory_store=memory,
-            run_id=run_id,
-            run_logger=run_logger,
-            status_reporter=lambda st: self.update_agent_status(run_id, st),
-        )
+        # Build the registry and background task inside the request backend
+        # context so this run can use the dashboard-selected provider even if
+        # the global switch-status endpoint was delayed by a busy local runtime.
+        with use_llm_backend(llm_backend):
+            registry = AgentRegistry(
+                bus=bus,
+                memory_store=memory,
+                run_id=run_id,
+                run_logger=run_logger,
+                status_reporter=lambda st: self.update_agent_status(run_id, st),
+            )
 
-        # Start orchestrator pipeline as a background task (within the server process).
-        record.task = asyncio.create_task(self._run_pipeline(record, ws, prompt, registry))
+            # Start orchestrator pipeline as a background task (within the server process).
+            # asyncio.create_task copies ContextVars on Python 3.11+, preserving llm_backend.
+            record.task = asyncio.create_task(self._run_pipeline(record, ws, run_prompt, registry))
         return run_id
 
     def _make_logger(self, run_id: str, bus: MessageBus):
@@ -123,6 +188,7 @@ class RunManager:
 
             log(f"Workspace created: {ws.run_root}")
             log(f"Project root: {ws.project_root}")
+            log(f"Code pipeline backend: {active_backend()}")
 
             orchestrator = await registry.spawn("orchestrator")
             await orchestrator.run(project_root=ws.project_root, user_prompt=prompt)
@@ -165,6 +231,8 @@ class RunManager:
             created_at=rec.created_at,
             updated_at=rec.updated_at,
             project_root=rec.project_root,
+            prompt=rec.prompt,
+            input_mode=rec.input_mode,
             logs=rec.logs,
             agent_statuses=list(rec.agent_statuses.values()),
             result=rec.result,

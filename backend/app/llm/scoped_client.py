@@ -1,24 +1,45 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 
 class ScopedLLMClient:
-    """A lightweight wrapper that pins an LLM "purpose" for an agent instance.
+    """Pins an LLM purpose for an agent and mirrors LLM calls into run logs."""
 
-    This lets us route OpenAI models differently for:
-      - Q&A (purpose="qa")
-      - Coding pipeline (purpose="code")
-
-    Without changing the orchestrator/agent hierarchy or requiring every agent
-    call-site to pass `purpose=` explicitly.
-    """
-
-    def __init__(self, base: Any, *, purpose: str) -> None:
+    def __init__(self, base: Any, *, purpose: str, run_logger: Optional[Callable[[str], None]] = None) -> None:
         self._base = base
         self._purpose = purpose
-        # Preserve a readable backend name for logs.
+        self._run_logger = run_logger
         self.backend = getattr(base, "backend", "llm")
+
+    def _log(self, message: str) -> None:
+        if not callable(self._run_logger):
+            return
+        try:
+            self._run_logger(message)
+        except Exception:
+            pass
+
+    def _start(self, method: str, purpose: str) -> float:
+        self._log(f"LLM {self.backend}/{purpose} {method} started")
+        return time.monotonic()
+
+    def _finish(self, method: str, purpose: str, started: float, result: Any = None) -> None:
+        elapsed = time.monotonic() - started
+        extra = ""
+        if isinstance(result, str):
+            extra = f", chars={len(result)}"
+        elif isinstance(result, (dict, list)):
+            extra = f", type={type(result).__name__}"
+        self._log(f"LLM {self.backend}/{purpose} {method} finished in {elapsed:.1f}s{extra}")
+
+    def _fail(self, method: str, purpose: str, started: float, err: BaseException) -> None:
+        elapsed = time.monotonic() - started
+        msg = str(err or "").replace("\n", " ")
+        if len(msg) > 300:
+            msg = msg[:297] + "..."
+        self._log(f"LLM {self.backend}/{purpose} {method} failed after {elapsed:.1f}s: {type(err).__name__}: {msg}")
 
     def is_available(self) -> bool:
         fn = getattr(self._base, "is_available", None)
@@ -39,11 +60,17 @@ class ScopedLLMClient:
         purpose: Optional[str] = None,
     ) -> str:
         effective_purpose = purpose or self._purpose
+        started = self._start("chat_text", effective_purpose)
         try:
-            return self._base.chat_text(system=system, messages=messages, temperature=temperature, purpose=effective_purpose)
-        except TypeError:
-            # Backward compat for any custom LLM client that doesn't accept purpose.
-            return self._base.chat_text(system=system, messages=messages, temperature=temperature)
+            try:
+                result = self._base.chat_text(system=system, messages=messages, temperature=temperature, purpose=effective_purpose)
+            except TypeError:
+                result = self._base.chat_text(system=system, messages=messages, temperature=temperature)
+            self._finish("chat_text", effective_purpose, started, result)
+            return result
+        except Exception as e:
+            self._fail("chat_text", effective_purpose, started, e)
+            raise
 
     def chat_json(
         self,
@@ -54,10 +81,17 @@ class ScopedLLMClient:
         purpose: Optional[str] = None,
     ) -> Any:
         effective_purpose = purpose or self._purpose
+        started = self._start("chat_json", effective_purpose)
         try:
-            return self._base.chat_json(system=system, messages=messages, temperature=temperature, purpose=effective_purpose)
-        except TypeError:
-            return self._base.chat_json(system=system, messages=messages, temperature=temperature)
+            try:
+                result = self._base.chat_json(system=system, messages=messages, temperature=temperature, purpose=effective_purpose)
+            except TypeError:
+                result = self._base.chat_json(system=system, messages=messages, temperature=temperature)
+            self._finish("chat_json", effective_purpose, started, result)
+            return result
+        except Exception as e:
+            self._fail("chat_json", effective_purpose, started, e)
+            raise
 
     async def chat_text_async(
         self,
@@ -69,21 +103,28 @@ class ScopedLLMClient:
         purpose: Optional[str] = None,
     ) -> str:
         effective_purpose = purpose or self._purpose
+        started = self._start("chat_text_async", effective_purpose)
         try:
-            return await self._base.chat_text_async(
-                system=system,
-                messages=messages,
-                temperature=temperature,
-                timeout_s=timeout_s,
-                purpose=effective_purpose,
-            )
-        except TypeError:
-            return await self._base.chat_text_async(
-                system=system,
-                messages=messages,
-                temperature=temperature,
-                timeout_s=timeout_s,
-            )
+            try:
+                result = await self._base.chat_text_async(
+                    system=system,
+                    messages=messages,
+                    temperature=temperature,
+                    timeout_s=timeout_s,
+                    purpose=effective_purpose,
+                )
+            except TypeError:
+                result = await self._base.chat_text_async(
+                    system=system,
+                    messages=messages,
+                    temperature=temperature,
+                    timeout_s=timeout_s,
+                )
+            self._finish("chat_text_async", effective_purpose, started, result)
+            return result
+        except Exception as e:
+            self._fail("chat_text_async", effective_purpose, started, e)
+            raise
 
     async def chat_json_async(
         self,
@@ -95,18 +136,25 @@ class ScopedLLMClient:
         purpose: Optional[str] = None,
     ) -> Any:
         effective_purpose = purpose or self._purpose
+        started = self._start("chat_json_async", effective_purpose)
         try:
-            return await self._base.chat_json_async(
-                system=system,
-                messages=messages,
-                temperature=temperature,
-                timeout_s=timeout_s,
-                purpose=effective_purpose,
-            )
-        except TypeError:
-            return await self._base.chat_json_async(
-                system=system,
-                messages=messages,
-                temperature=temperature,
-                timeout_s=timeout_s,
-            )
+            try:
+                result = await self._base.chat_json_async(
+                    system=system,
+                    messages=messages,
+                    temperature=temperature,
+                    timeout_s=timeout_s,
+                    purpose=effective_purpose,
+                )
+            except TypeError:
+                result = await self._base.chat_json_async(
+                    system=system,
+                    messages=messages,
+                    temperature=temperature,
+                    timeout_s=timeout_s,
+                )
+            self._finish("chat_json_async", effective_purpose, started, result)
+            return result
+        except Exception as e:
+            self._fail("chat_json_async", effective_purpose, started, e)
+            raise

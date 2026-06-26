@@ -26,6 +26,7 @@ def main() -> int:
     sys.path.insert(0, str(backend))
 
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     if args.force:
         os.environ["FORCE_TRAIN"] = "1"
 

@@ -1,17 +1,120 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { askQA, createRun, getRun, uploadFile, listUploads, getModelBackend, setModelBackend } from './api/client.js'
+import { askQA, createRun, createRunWithDocument, getRun, uploadFile, listUploads, submitModelFeedback, getFeedbackStats, getLocalStatus, getModelBackend } from './api/client.js'
 import PromptPanel from './components/PromptPanel.jsx'
 import RunsPanel from './components/RunsPanel.jsx'
 import LogsPanel from './components/LogsPanel.jsx'
 import AgentPanel from './components/AgentPanel.jsx'
 import TraceViewer from './components/TraceViewer.jsx'
 
-function ChatMessage({ msg, conversationId, onViewTrace, onFollowup }) {
+
+
+function FeedbackControls({
+  targetType,
+  targetId,
+  conversationId = null,
+  runId = null,
+  promptText = '',
+  responseText = '',
+  backend = 'local',
+  projectPath = '',
+  mode = 'qa',
+  inputMode = 'text',
+  onSubmitted,
+  disabled = false
+}) {
+  const [open, setOpen] = useState(false)
+  const [comment, setComment] = useState('')
+  const [correction, setCorrection] = useState('')
+  const [saving, setSaving] = useState(false)
+  const [message, setMessage] = useState('')
+  const [error, setError] = useState('')
+
+  async function send(score, opts = {}) {
+    setSaving(true)
+    setError('')
+    setMessage('')
+    try {
+      const corrected = opts.corrected_response ?? correction
+      const notes = opts.comment ?? comment
+      const res = await submitModelFeedback({
+        target_type: targetType,
+        target_id: targetId,
+        conversation_id: conversationId,
+        run_id: runId,
+        score,
+        prompt: promptText,
+        response: responseText,
+        corrected_response: corrected,
+        comment: notes,
+        backend,
+        project_path: projectPath,
+        mode,
+        input_mode: inputMode,
+        add_to_training: true,
+        meta: { source: 'dashboard_feedback_controls' }
+      })
+      setMessage(res?.message || 'Feedback saved.')
+      if (corrected) setOpen(false)
+      onSubmitted?.(res, { score, corrected_response: corrected, comment: notes })
+    } catch (e) {
+      setError(e?.message || String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="feedback-box">
+      <div className="chat-actions">
+        <button type="button" className="chat-chip" disabled={disabled || saving} onClick={() => send(1, { corrected_response: '', comment: comment || 'Good response' })}>
+          👍 Good
+        </button>
+        <button type="button" className="chat-chip" disabled={disabled || saving} onClick={() => send(-1, { corrected_response: '', comment: comment || 'Bad response' })}>
+          👎 Bad
+        </button>
+        <button type="button" className="chat-chip" disabled={disabled || saving} onClick={() => setOpen((v) => !v)}>
+          ✍ Add correction
+        </button>
+      </div>
+
+      {open ? (
+        <div style={{ marginTop: 8 }}>
+          <label className="small">Correction / preferred response</label>
+          <textarea
+            value={correction}
+            onChange={(e) => setCorrection(e.target.value)}
+            placeholder="Write the answer or patch the model should have produced. This is queued for the manual RLHF/LoRA trainer."
+            style={{ minHeight: 90 }}
+          />
+          <label className="small" style={{ marginTop: 8 }}>Optional feedback note</label>
+          <input
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            placeholder="What was wrong or what should be preferred?"
+          />
+          <div className="chat-actions" style={{ marginTop: 8 }}>
+            <button type="button" disabled={disabled || saving || !correction.trim()} onClick={() => send(0)}>
+              {saving ? 'Saving…' : 'Save correction for RL'}
+            </button>
+            <button type="button" className="chat-chip" disabled={saving} onClick={() => setOpen(false)}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {message ? <div className="small" style={{ marginTop: 6 }}>{message}</div> : null}
+      {error ? <div className="small" style={{ marginTop: 6 }}><b>Feedback error:</b> {error}</div> : null}
+    </div>
+  )
+}
+
+function ChatMessage({ msg, conversationId, onViewTrace, onFollowup, llmBackend, projectPath, promptText, promptInputMode, onFeedbackSubmitted, showInternal = false }) {
   const isUser = msg.role === 'user'
-  const title = isUser ? 'You' : (msg.orchestrator || 'assistant')
-  const subtitle = isUser
-    ? (msg.input_mode ? `input: ${msg.input_mode}` : '')
-    : (msg.meta?.kind ? msg.meta.kind : '')
+  const title = isUser ? 'You' : (showInternal ? (msg.orchestrator || 'assistant') : 'Assistant')
+  const subtitle = showInternal
+    ? (isUser ? (msg.input_mode ? `input: ${msg.input_mode}` : '') : (msg.meta?.kind ? msg.meta.kind : ''))
+    : ''
 
   const turnId = msg.meta?.turn_id
   const canTrace = Boolean(conversationId && turnId)
@@ -28,12 +131,12 @@ function ChatMessage({ msg, conversationId, onViewTrace, onFollowup }) {
         <div className="chat-meta">
           <b>{title}</b>
           {subtitle ? <span style={{ opacity: 0.75 }}>{subtitle}</span> : null}
-          <span style={{ opacity: 0.6 }}>{msg.created_at}</span>
+          {showInternal && msg.created_at ? <span style={{ opacity: 0.6 }}>{msg.created_at}</span> : null}
         </div>
 
         <div style={{ whiteSpace: 'pre-wrap' }}>{msg.content}</div>
 
-        {!isUser && msg.meta?.domain ? (
+        {!isUser && showInternal && msg.meta?.domain ? (
           <div className="small" style={{ marginTop: 8, opacity: 0.85 }}>
             domain: {msg.meta.domain}
           </div>
@@ -82,6 +185,21 @@ function ChatMessage({ msg, conversationId, onViewTrace, onFollowup }) {
           </div>
         ) : null}
 
+        {!isUser && !msg.meta?.pending ? (
+          <FeedbackControls
+            targetType="qa"
+            targetId={turnId}
+            conversationId={conversationId}
+            promptText={promptText || ''}
+            responseText={msg.content || ''}
+            backend={llmBackend}
+            projectPath={projectPath}
+            mode="qa"
+            inputMode={promptInputMode || 'text'}
+            onSubmitted={onFeedbackSubmitted}
+          />
+        ) : null}
+
         {canTrace ? (
           <div className="chat-actions" style={{ marginTop: 10 }}>
             <button
@@ -115,11 +233,18 @@ export default function App() {
   const [codePrompt, setCodePrompt] = useState('Add a new function greet(name) and tests for it.')
   const [qaDraft, setQaDraft] = useState('')
   const [copyToWorkspace, setCopyToWorkspace] = useState(false)
+  const [codeRunDocument, setCodeRunDocument] = useState(null)
 
   const [llmBackend, setLlmBackend] = useState('local')
   const [llmStatus, setLlmStatus] = useState(null)
-  const [modelSwitching, setModelSwitching] = useState(false)
+  const [backendStatusLoaded, setBackendStatusLoaded] = useState(false)
   const [modelSwitchError, setModelSwitchError] = useState(null)
+
+  const [feedbackStats, setFeedbackStats] = useState(null)
+  const [feedbackStatsError, setFeedbackStatsError] = useState(null)
+  const [feedbackNotice, setFeedbackNotice] = useState(null)
+  const [localStatus, setLocalStatus] = useState(null)
+  const [localStatusError, setLocalStatusError] = useState(null)
 
   const [runId, setRunId] = useState(null)
   const [run, setRun] = useState(null)
@@ -151,23 +276,82 @@ export default function App() {
     } catch (_) {}
   }, [speakVoiceResponses])
 
-  useEffect(() => {
-    let cancelled = false
-    getModelBackend()
-      .then((status) => {
-        if (cancelled) return
-        setLlmStatus(status)
-        setLlmBackend(status?.active_backend || 'local')
-        setModelSwitchError(null)
-      })
-      .catch((e) => {
-        if (cancelled) return
-        setModelSwitchError(e?.message || String(e))
-      })
-    return () => {
-      cancelled = true
+
+  async function refreshModelStatus() {
+    try {
+      const status = await getModelBackend()
+      const active = String(status?.active_backend || 'local').toLowerCase()
+      setLlmStatus(status)
+      setLlmBackend(active || 'local')
+      setBackendStatusLoaded(true)
+      setModelSwitchError(null)
+      return status
+    } catch (e) {
+      setModelSwitchError(e?.message || String(e))
+      setBackendStatusLoaded(true)
+      return null
     }
+  }
+
+  useEffect(() => {
+    refreshModelStatus()
   }, [])
+
+
+
+  async function refreshFeedbackStats() {
+    try {
+      const stats = await getFeedbackStats()
+      setFeedbackStats(stats)
+      setFeedbackStatsError(null)
+      return stats
+    } catch (e) {
+      setFeedbackStatsError(e?.message || String(e))
+      return null
+    }
+  }
+
+  async function refreshLocalStatus(deep = false) {
+    try {
+      const status = await getLocalStatus({ deep })
+      setLocalStatus(status)
+      setLocalStatusError(null)
+    } catch (e) {
+      setLocalStatusError(e?.message || String(e))
+    }
+  }
+
+  function handleFeedbackSubmitted(res, payload = {}) {
+    setFeedbackNotice(res?.message || 'Feedback saved.')
+    // Optimistically update the visible counters immediately, then reconcile
+    // against the backend DB stats.
+    setFeedbackStats((prev) => {
+      const base = prev || { total: 0, positive: 0, negative: 0, corrections: 0, max_id: 0, by_backend: {}, by_target_type: {} }
+      const reward = Number(res?.reward ?? payload?.score ?? 0)
+      const hasCorrection = Boolean(String(payload?.corrected_response || '').trim())
+      return {
+        ...base,
+        total: Number(base.total || 0) + 1,
+        positive: Number(base.positive || 0) + (reward > 0 ? 1 : 0),
+        negative: Number(base.negative || 0) + (reward < 0 ? 1 : 0),
+        corrections: Number(base.corrections || 0) + (hasCorrection ? 1 : 0),
+        max_id: Math.max(Number(base.max_id || 0), Number(res?.feedback_id || 0))
+      }
+    })
+    refreshFeedbackStats()
+  }
+
+  useEffect(() => {
+    refreshFeedbackStats()
+    const iv = window.setInterval(() => refreshFeedbackStats(), 5000)
+    return () => window.clearInterval(iv)
+  }, [])
+
+  useEffect(() => {
+    // Shallow status only: do not auto-import torch/CUDA from the dashboard.
+    // Deep CUDA checks are manual via the Check CUDA/RTX button.
+    if (backendStatusLoaded && llmBackend === 'local') refreshLocalStatus(false)
+  }, [backendStatusLoaded, llmBackend])
 
 
 // ------------------------------
@@ -238,22 +422,6 @@ function prepareSpeechText(text) {
     setTraceOpen(true)
   }
 
-  async function handleModelBackendChange(nextBackend) {
-    const backend = String(nextBackend || '').trim().toLowerCase()
-    if (!backend || backend === llmBackend) return
-    setModelSwitching(true)
-    setModelSwitchError(null)
-    try {
-      const status = await setModelBackend(backend)
-      setLlmStatus(status)
-      setLlmBackend(status?.active_backend || backend)
-    } catch (e) {
-      setModelSwitchError(e?.message || String(e))
-    } finally {
-      setModelSwitching(false)
-    }
-  }
-
   async function onStart(overrideQuestion = null) {
     setStarting(true)
     try {
@@ -285,7 +453,9 @@ function prepareSpeechText(text) {
           id: optimisticTurnId + '-a',
           conversation_id: qaConversationId,
           role: 'assistant',
-          content: '…',
+          content: (llmBackend === 'local'
+            ? 'Local model is working… first request may download/load weights. Logs appear after the Q&A turn completes; backend terminal shows live HF loading/generation.'
+            : '…'),
           orchestrator: 'hive_master_orchestrator',
           input_mode: null,
           meta: { turn_id: optimisticTurnId, pending: true },
@@ -314,12 +484,15 @@ if (speakVoiceResponses) {
         setRunId(null)
         setRun(null)
       } else {
-        const resp = await createRun({
+        const runPayload = {
           project_path: projectPath,
           prompt: codePrompt,
           copy_project_to_workspace: copyToWorkspace,
           input_mode: inputMode
-        })
+        }
+        const resp = codeRunDocument
+          ? await createRunWithDocument({ ...runPayload, file: codeRunDocument })
+          : await createRun(runPayload)
         setRunId(resp.run_id)
         setRun(null)
         resetConversation()
@@ -390,24 +563,53 @@ if (speakVoiceResponses) {
     if (!runId) return
 
     let cancelled = false
+    let missingCount = 0
+    let intervalId = null
     async function tick() {
       try {
         const r = await getRun(runId)
         if (cancelled) return
+        missingCount = 0
         setRun(r)
+        if (r && r.status && r.status !== 'running' && intervalId) {
+          window.clearInterval(intervalId)
+          intervalId = null
+        }
       } catch (e) {
         if (cancelled) return
+        const msg = e?.message || String(e)
         console.error(e)
+        if (msg.includes('HTTP 404') || msg.includes('run_id not found')) {
+          missingCount += 1
+          if (missingCount >= 2) {
+            setRun({
+              run_id: runId,
+              status: 'missing',
+              created_at: '',
+              updated_at: new Date().toISOString(),
+              project_root: projectPath,
+              prompt: codePrompt,
+              input_mode: inputMode,
+              logs: [`Run ${runId} is no longer available on the backend. This usually happens after a backend restart/reload. Polling stopped.`],
+              agent_statuses: [],
+              result: null,
+              error: 'Run not found on backend. Start a new run.'
+            })
+            setRunId(null)
+            if (intervalId) window.clearInterval(intervalId)
+            intervalId = null
+          }
+        }
       }
     }
 
     tick()
-    const iv = setInterval(() => tick(), 1000)
+    intervalId = window.setInterval(() => tick(), 1000)
     return () => {
       cancelled = true
-      clearInterval(iv)
+      if (intervalId) window.clearInterval(intervalId)
     }
-  }, [runId])
+  }, [runId, projectPath, codePrompt, inputMode])
 
   const agentStatuses = run?.agent_statuses || []
   const logs = run?.logs || []
@@ -481,11 +683,31 @@ useEffect(() => {
     if (!starting) onStart(q)
   }
 
+  function qaPromptForTurn(turnId) {
+    if (!turnId || !qaMessages) return { content: '', input_mode: 'text' }
+    const found = [...qaMessages].reverse().find((m) => m.role === 'user' && m.meta?.turn_id === turnId)
+    return { content: found?.content || '', input_mode: found?.input_mode || 'text' }
+  }
+
+  const localCudaSummary = (() => {
+    if (!localStatus) return 'Not checked yet.'
+    if (localStatus.cuda_available == null || localStatus.deep === false) return 'Shallow status only; CUDA not probed yet.'
+    if (!localStatus.cuda_available) return 'CUDA not visible; local model/trainer will use CPU unless PyTorch CUDA is fixed.'
+    const resolved = String(localStatus.resolved_device || 'cuda:0')
+    const idx = resolved.includes(':') ? Number(resolved.split(':').pop()) : 0
+    const devices = Array.isArray(localStatus.cuda_devices) ? localStatus.cuda_devices : []
+    const dev = devices.find((d) => Number(d.index) === idx) || devices[0]
+    const name = dev?.name || resolved
+    const used = dev?.reserved_mb ?? dev?.allocated_mb ?? 0
+    const total = dev?.total_memory_mb ?? '?'
+    return `${localStatus.loaded ? 'loaded' : 'not loaded yet'} • ${resolved} • ${name} • VRAM reserved ${used}/${total} MB`
+  })()
+
   return (
     <div className="container">
       <div className="header">
         <h1 style={{ margin: 0 }}>Agentic Hive Studio</h1>
-        <div className="small">React UI • FastAPI backend • Multi-agent orchestration • model: <b>{llmBackend}</b></div>
+        <div className="small">React UI • FastAPI backend • Multi-agent orchestration • startup backend: <b>{llmBackend}</b></div>
       </div>
 
       <PromptPanel
@@ -510,16 +732,36 @@ useEffect(() => {
         setPrompt={mode === 'qa' ? setQaDraft : setCodePrompt}
         copyToWorkspace={copyToWorkspace}
         setCopyToWorkspace={setCopyToWorkspace}
+        codeRunDocument={codeRunDocument}
+        setCodeRunDocument={setCodeRunDocument}
         onStart={onStart}
         speakVoiceResponses={speakVoiceResponses}
         setSpeakVoiceResponses={setSpeakVoiceResponses}
         llmBackend={llmBackend}
         llmStatus={llmStatus}
-        modelSwitching={modelSwitching}
+        modelSwitching={false}
         modelSwitchError={modelSwitchError}
-        onLlmBackendChange={handleModelBackendChange}
-        disabled={starting || modelSwitching}
+        onLlmBackendChange={null}
+        disabled={starting}
       />
+
+      <div className="card status-card">
+        <div className="small">
+          <b>RL feedback:</b> total {feedbackStats?.total ?? 0} • positive {feedbackStats?.positive ?? 0} • negative {feedbackStats?.negative ?? 0} • corrections {feedbackStats?.corrections ?? 0}
+          {feedbackNotice ? <> • {feedbackNotice}</> : null}
+          {feedbackStatsError ? <> • stats error: {feedbackStatsError}</> : null}
+          <button type="button" className="chat-chip" style={{ marginLeft: 8 }} onClick={refreshFeedbackStats}>Refresh RL stats</button>
+        </div>
+        {llmBackend === 'local' ? (
+          <div className="small" style={{ marginTop: 6 }}>
+            <b>Local GPU status:</b> {localCudaSummary}
+            {localStatus?.training ? <> • trainer device: {localStatus.training.device_config} • feedback weight: {localStatus.training.feedback_weight}</> : null}
+            {localStatusError ? <> • status error: {localStatusError}</> : null}
+            <button type="button" className="chat-chip" style={{ marginLeft: 8 }} onClick={() => refreshLocalStatus(false)}>Refresh shallow</button>
+            <button type="button" className="chat-chip" style={{ marginLeft: 8 }} onClick={() => refreshLocalStatus(true)}>Check CUDA/RTX</button>
+          </div>
+        ) : null}
+      </div>
 
       {mode === 'code' ? (
         <>
@@ -529,12 +771,28 @@ useEffect(() => {
             <LogsPanel logs={logs} />
           </div>
 
-          {run?.result && (
+          {run && run.status !== 'running' ? (
             <div className="card">
-              <h3 style={{ marginTop: 0 }}>Result (JSON)</h3>
-              <pre>{JSON.stringify(run.result, null, 2)}</pre>
+              <h3 style={{ marginTop: 0 }}>{run.result ? 'Result (JSON)' : 'Run result / error'}</h3>
+              {run.result ? (
+                <pre>{JSON.stringify(run.result, null, 2)}</pre>
+              ) : (
+                <pre>{run.error || (run.logs || []).slice(-120).join('\n') || 'No result payload was produced.'}</pre>
+              )}
+              <FeedbackControls
+                targetType="code"
+                targetId={run.run_id}
+                runId={run.run_id}
+                promptText={run.result?.prompt || run.prompt || codePrompt}
+                responseText={run.result ? JSON.stringify(run.result, null, 2) : (run.error || (run.logs || []).slice(-120).join('\n') || '')}
+                backend={llmBackend}
+                projectPath={run.result?.project_root || run.project_root || projectPath}
+                mode="code"
+                inputMode={run.input_mode || inputMode}
+                onSubmitted={handleFeedbackSubmitted}
+              />
             </div>
-          )}
+          ) : null}
         </>
       ) : (
         <>
@@ -580,6 +838,12 @@ useEffect(() => {
                       conversationId={qaConversationId}
                       onViewTrace={openTrace}
                       onFollowup={sendFollowup}
+                      llmBackend={llmBackend}
+                      projectPath={projectPath}
+                      promptText={qaPromptForTurn(m.meta?.turn_id).content}
+                      promptInputMode={qaPromptForTurn(m.meta?.turn_id).input_mode}
+                      onFeedbackSubmitted={handleFeedbackSubmitted}
+                      showInternal={qaShowInternal}
                     />
                   ))}
 
@@ -597,7 +861,7 @@ useEffect(() => {
                   <div>
                     <b>Upload documents / images</b>
                     <div className="small" style={{ opacity: 0.75 }}>
-                      Ingested into hive memory (usable by local + OpenAI) and optionally added to the background training set.
+                      Ingested into hive memory for the local model and optionally added to the manual RLHF/background training set.
                     </div>
                   </div>
                   <input type="file" multiple onChange={handleUploadSelected} disabled={starting || uploading} />

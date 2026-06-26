@@ -30,6 +30,8 @@ export default function PromptPanel({
   setPrompt,
   copyToWorkspace,
   setCopyToWorkspace,
+  codeRunDocument,
+  setCodeRunDocument,
   speakVoiceResponses,
   setSpeakVoiceResponses,
   llmBackend = 'local',
@@ -51,9 +53,9 @@ export default function PromptPanel({
 
   const [speechLang, setSpeechLang] = useState(() => {
     try {
-      return window.localStorage.getItem('speechRecognitionLang') || 'en-IN'
+      return window.localStorage.getItem('speechRecognitionLang') || 'en-US'
     } catch (_) {
-      return 'en-IN'
+      return 'en-US'
     }
   })
   const speechLangRef = useRef(speechLang)
@@ -347,10 +349,10 @@ export default function PromptPanel({
 
     const r = new SR()
     r.continuous = true
-    r.interimResults = true
+    r.interimResults = false
     r.lang = speechLangRef.current || 'en-IN'
     try {
-      r.maxAlternatives = 3
+      r.maxAlternatives = 5
     } catch (_) {}
 
     r.onresult = (event) => {
@@ -608,25 +610,14 @@ export default function PromptPanel({
           </select>
 
           <div style={{ marginTop: 10 }}>
-            <label>Model backend</label>
-            <select
-              value={llmBackend || 'local'}
-              onChange={(e) => onLlmBackendChange?.(e.target.value)}
-              disabled={disabled || modelSwitching}
-            >
-              <option value="local">Local</option>
-              <option value="gemini">Gemini</option>
-              <option value="openai">OpenAI</option>
-            </select>
+            <label>Model</label>
             <div className="small" style={{ marginTop: 6 }}>
-              Active: <b>{llmBackend || 'local'}</b>
-              {modelSwitching ? ' • switching...' : ''}
-              {llmStatus?.models?.[llmBackend] ? ` • ${llmStatus.models[llmBackend]}` : ''}
+              Startup backend: <b>{llmBackend}</b>
+              {llmStatus?.models?.[llmBackend] ? <> • model: <b>{llmStatus.models[llmBackend]}</b></> : null}
+              {" "}• edit <code>backend/.env</code> <code>LLM_BACKEND</code> and restart FastAPI to change providers.
             </div>
             {modelSwitchError ? (
-              <div className="small" style={{ marginTop: 6 }}>
-                <b>Model switch error:</b> {modelSwitchError}
-              </div>
+              <div className="small error" style={{ marginTop: 6 }}>Backend status error: {modelSwitchError}</div>
             ) : null}
           </div>
 
@@ -673,6 +664,27 @@ export default function PromptPanel({
                   Copy non-sample project into backend workspace
                 </label>
                 <div className="small" style={{ marginTop: 6 }}>sample_projects are always edited directly, even when this is checked.</div>
+
+                <div style={{ marginTop: 12, padding: 10, border: '1px dashed #ddd', borderRadius: 10 }}>
+                  <label>Optional project context document</label>
+                  <input
+                    type="file"
+                    onChange={(e) => setCodeRunDocument?.((e.target.files && e.target.files[0]) || null)}
+                    disabled={disabled}
+                  />
+                  {codeRunDocument ? (
+                    <div className="small" style={{ marginTop: 6, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <span>Selected: <b>{codeRunDocument.name}</b></span>
+                      <button type="button" className="chat-chip" onClick={() => setCodeRunDocument?.(null)} disabled={disabled}>
+                        Clear
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="small" style={{ marginTop: 6 }}>
+                      Creates the code project from your prompt plus this one-off document. This does not use the existing Hive-memory upload/chunking flow.
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 

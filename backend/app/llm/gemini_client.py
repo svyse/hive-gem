@@ -163,8 +163,8 @@ class GeminiClient:
 
         url = f"{self.api_base}/models/{model}:generateContent"
         timeout_s = float(settings.llm_timeout_s or 60)
-        retries = max(0, int(getattr(settings, "llm_backend_retry_attempts", 2) or 0))
-        backoff = max(0.1, float(getattr(settings, "llm_backend_retry_backoff_s", 1.0) or 1.0))
+        retries = max(0, int(getattr(settings, "gemini_max_retries", getattr(settings, "llm_backend_retry_attempts", 2)) or 0))
+        backoff = max(0.1, float(getattr(settings, "gemini_retry_backoff_s", getattr(settings, "llm_backend_retry_backoff_s", 1.0)) or 1.0))
 
         for attempt in range(retries + 1):
             try:
@@ -177,21 +177,31 @@ class GeminiClient:
                         },
                         json=payload,
                     )
-            except httpx.TimeoutException as e:
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                # httpx.RemoteProtocolError("Server disconnected without sending a response")
+                # is a transient transport failure seen on Windows/proxy/CUDA-heavy
+                # dev boxes. Treat it like a retryable hosted-provider failure
+                # instead of surfacing it as an immediate domain-agent error.
+                err_kind = type(e).__name__
                 if attempt < retries:
-                    delay = backoff * (2**attempt)
+                    delay = min(
+                        max(0.1, float(getattr(settings, "gemini_retry_max_backoff_s", 8.0) or 8.0)),
+                        backoff * (2**attempt),
+                    )
                     log.warning(
-                        "Gemini request timed out (model=%s, attempt=%s/%s). Retrying in %.1fs.",
+                        "Gemini transport failure (model=%s, attempt=%s/%s, %s: %s). Retrying in %.1fs.",
                         model,
                         attempt + 1,
                         retries + 1,
+                        err_kind,
+                        e,
                         delay,
                     )
                     time.sleep(delay)
                     continue
                 self._set_cooldown(
                     seconds=float(getattr(settings, "llm_backend_error_cooldown_s", 300.0) or 300.0),
-                    reason=f"Gemini timeout while calling {model}: {e}",
+                    reason=f"Gemini transport failure while calling {model}: {err_kind}: {e}",
                 )
                 raise
 

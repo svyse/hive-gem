@@ -7,6 +7,8 @@ from typing import Any, Dict, List
 from app.agents.base import BaseAgent
 from app.llm.prompts import LOGIC_REVIEW_SYSTEM
 from app.utils.file_utils import list_files, read_text
+from app.utils.repetition_guard import sanitize_operations
+from app.utils.local_code_fallbacks import plan_is_deterministic_fallback
 
 
 def _truncate(s: str, max_chars: int) -> str:
@@ -19,6 +21,23 @@ class LogicAgent(BaseAgent):
     async def review_plan(self, *, project_root: Path, user_prompt: str, plan: Dict[str, Any], context: Dict[str, Any] | None = None) -> Dict[str, Any]:
         self.set_state("reviewing")
         self.log("reviewing plan")
+
+        plan_meta = plan.get("metadata") if isinstance(plan, dict) else {}
+        local_nlp_plan = isinstance(plan_meta, dict) and bool(plan_meta.get("local_nlp_project_plan"))
+        if plan_is_deterministic_fallback(plan) or local_nlp_plan:
+            review_kind = "local NLP file-block" if local_nlp_plan else "deterministic Python"
+            review = {
+                "approved": True,
+                "issues": [
+                    f"{review_kind} plan detected; skipped local JSON logic review to avoid repeated-token/non-object review failures."
+                ],
+                "recommended_plan_patch": {"operations": []},
+            }
+            self.latest_result = review
+            self.remember(json.dumps(review), tags=["logic", "review", "deterministic_fallback" if not local_nlp_plan else "local_nlp"], success=None)
+            self.add_type_memory(json.dumps(review), tags=["logic", "review", "deterministic_fallback" if not local_nlp_plan else "local_nlp"], success=None)
+            self.set_state("idle")
+            return review
 
         if not self.llm_available():
             review = {
@@ -80,14 +99,40 @@ class LogicAgent(BaseAgent):
             }
         ]
 
-        review = await self.ctx.llm.chat_json_async(system=LOGIC_REVIEW_SYSTEM, messages=messages, temperature=0.2)
+        try:
+            review = await self.ctx.llm.chat_json_async(
+                system=LOGIC_REVIEW_SYSTEM, messages=messages, temperature=0.2, purpose="code-json-review"
+            )
+        except Exception as e:
+            review = {
+                "approved": True,
+                "issues": [
+                    f"LogicAgent local JSON review failed ({type(e).__name__}: {e}); continuing with the sanitized original plan."
+                ],
+                "recommended_plan_patch": {"operations": []},
+            }
 
         if not isinstance(review, dict):
-            raise ValueError("LogicAgent review must be a JSON object")
+            review = {
+                "approved": True,
+                "issues": [
+                    f"LogicAgent review returned {type(review).__name__}, not a JSON object; continuing with the sanitized original plan."
+                ],
+                "recommended_plan_patch": {"operations": []},
+            }
 
         review.setdefault("approved", True)
         review.setdefault("issues", [])
         review.setdefault("recommended_plan_patch", {"operations": []})
+        patch = review.get("recommended_plan_patch") or {"operations": []}
+        if not isinstance(patch, dict):
+            patch = {"operations": []}
+        patch["operations"], dropped_ops = sanitize_operations(patch.get("operations") or [])
+        review["recommended_plan_patch"] = patch
+        if dropped_ops:
+            issues = review.get("issues") if isinstance(review.get("issues"), list) else []
+            issues.append(f"Dropped {dropped_ops} unsafe repeated-token operation(s) from the logic patch.")
+            review["issues"] = issues
 
         self.latest_result = review
         self.remember(json.dumps(review), tags=["logic", "review"], success=None)

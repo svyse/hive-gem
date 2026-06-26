@@ -222,7 +222,7 @@ class AgentRegistry:
                 run_logger=self.run_logger,
                 status_reporter=self.status_reporter,
                 registry=self,
-                llm=ScopedLLMClient(self.llm, purpose=purpose),
+                llm=ScopedLLMClient(self.llm, purpose=purpose, run_logger=self.run_logger),
             )
 
             agent = cls(agent_id=agent_id, ctx=ctx)  # type: ignore[call-arg]
