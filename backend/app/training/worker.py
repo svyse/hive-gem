@@ -12,12 +12,40 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# Maintain the supported training entrypoint: python -m app.training.worker
+# Mask to the single RTX 3060-visible CUDA device before torch is imported.
+#
+# IMPORTANT:
+# PyTorch 2.0.x does not recognize PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True.
+# If that unsupported option is present, CUDA diagnostics can fail before training starts.
+# Sanitize it before importing torch.
+def _safe_cuda_alloc_conf(raw: str | None) -> str:
+    parts = []
+    for item in str(raw or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key = item.split(":", 1)[0].strip().lower()
+        if key == "expandable_segments":
+            continue
+        parts.append(item)
+
+    if not any(part.split(":", 1)[0].strip().lower() == "max_split_size_mb" for part in parts):
+        parts.append("max_split_size_mb:128")
+    return ",".join(parts)
+
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = _safe_cuda_alloc_conf(
+    os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
+)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 import torch
 
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from app.core.config import settings
 from app.llm.adapter_paths import resolve_model_adapter_dir, resolve_model_adapter_root, resolve_training_state_file
+from app.utils.repetition_guard import is_repetitive_text
 
 
 log = logging.getLogger(__name__)
@@ -57,6 +85,12 @@ _ERRORISH_TRAINING_PHRASES = (
     "please check the run log for details",
     "could not parse json from model output",
     "q&a agent output must be json object",
+    "repeated-token loop",
+    "repeated token",
+    "generation collapsed",
+    "generated repeated-token output",
+    "skipped generated operations because the local model repeated tokens",
+    "local model generation was stopped",
 )
 
 
@@ -64,11 +98,28 @@ def _include_upload_examples() -> bool:
     return bool(getattr(settings, "local_training_include_upload_examples", False))
 
 
+def _feedback_training_enabled() -> bool:
+    return bool(getattr(settings, "feedback_training_enabled", True))
+
+
+def _feedback_weight() -> int:
+    try:
+        return max(1, min(8, int(getattr(settings, "local_training_feedback_weight", 4) or 4)))
+    except Exception:
+        return 4
+
+
 def _looks_bad_training_text(text: Any) -> bool:
-    lowered = str(text or "").strip().lower()
+    raw = str(text or "").strip()
+    lowered = raw.lower()
     if not lowered:
         return True
-    return any(p in lowered for p in _ERRORISH_TRAINING_PHRASES)
+    if any(p in lowered for p in _ERRORISH_TRAINING_PHRASES):
+        return True
+    try:
+        return bool(is_repetitive_text(raw, min_chars=32))
+    except Exception:
+        return False
 
 
 def _pair_key(a: str, b: str) -> tuple[str, str]:
@@ -92,28 +143,38 @@ def _assistant_meta_excludes_training(meta_raw: Any) -> bool:
     return False
 
 
-def _current_db_max_ids() -> tuple[int, int]:
+def _current_db_max_ids() -> tuple[int, int, int]:
     db_path = Path(settings.memory_db_path).expanduser()
     if not db_path.exists():
-        return 0, 0
+        return 0, 0, 0
     try:
         conn = sqlite3.connect(str(db_path), timeout=10.0)
         cur = conn.cursor()
         row1 = cur.execute("SELECT COALESCE(MAX(id), 0) FROM conversation_messages").fetchone()
         row2 = cur.execute("SELECT COALESCE(MAX(id), 0) FROM training_examples").fetchone()
+        try:
+            row3 = cur.execute("SELECT COALESCE(MAX(id), 0) FROM model_feedback").fetchone()
+        except sqlite3.OperationalError:
+            row3 = [0]
         conn.close()
-        return int((row1 or [0])[0] or 0), int((row2 or [0])[0] or 0)
+        return (
+            int((row1 or [0])[0] or 0),
+            int((row2 or [0])[0] or 0),
+            int((row3 or [0])[0] or 0),
+        )
     except Exception:
-        return 0, 0
+        return 0, 0, 0
 
 
-def _normalize_state_ids(last_message_id: int, last_example_id: int) -> tuple[int, int]:
-    max_msg, max_ex = _current_db_max_ids()
+def _normalize_state_ids(last_message_id: int, last_example_id: int, last_feedback_id: int = 0) -> tuple[int, int, int]:
+    max_msg, max_ex, max_fb = _current_db_max_ids()
     if int(last_message_id or 0) > max_msg:
         last_message_id = 0
     if int(last_example_id or 0) > max_ex:
         last_example_id = 0
-    return int(last_message_id or 0), int(last_example_id or 0)
+    if int(last_feedback_id or 0) > max_fb:
+        last_feedback_id = 0
+    return int(last_message_id or 0), int(last_example_id or 0), int(last_feedback_id or 0)
 
 
 def _now_iso() -> str:
@@ -150,19 +211,20 @@ def _load_training_state_payload() -> Dict[str, Any]:
 
 
 
-def _load_training_state() -> tuple[int, int]:
-    """Return (last_message_id, last_training_example_id)."""
+def _load_training_state() -> tuple[int, int, int]:
+    """Return (last_message_id, last_training_example_id, last_feedback_id)."""
 
     data = _load_training_state_payload()
     try:
         last_msg = int(data.get("last_message_id") or 0)
         last_ex = int(data.get("last_training_example_id") or 0)
-        return _normalize_state_ids(last_msg, last_ex)
+        last_fb = int(data.get("last_feedback_id") or 0)
+        return _normalize_state_ids(last_msg, last_ex, last_fb)
     except Exception:
-        return 0, 0
+        return 0, 0, 0
 
 
-def _write_state(*, last_message_id: int, last_training_example_id: int, stats: Dict[str, Any]) -> None:
+def _write_state(*, last_message_id: int, last_training_example_id: int, last_feedback_id: int, stats: Dict[str, Any]) -> None:
     p = _training_state_file()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -171,6 +233,7 @@ def _write_state(*, last_message_id: int, last_training_example_id: int, stats: 
                 {
                     "last_message_id": int(last_message_id),
                     "last_training_example_id": int(last_training_example_id),
+                    "last_feedback_id": int(last_feedback_id),
                     "updated_at": _now_iso(),
                     "stats": stats,
                 },
@@ -269,11 +332,12 @@ def _has_peft() -> bool:
         return False
 
 
-def _count_new_items(last_message_id: int, last_example_id: int) -> int:
+def _count_new_items(last_message_id: int, last_example_id: int, last_feedback_id: int = 0) -> int:
     """Count new training signals since the last state.
 
     - assistant messages from conversations
-    - rows from training_examples (e.g., from uploads)
+    - rows from training_examples (uploads are opt-in)
+    - model_feedback rows with corrections or positive reward
     """
 
     db_path = Path(settings.memory_db_path).expanduser()
@@ -281,7 +345,9 @@ def _count_new_items(last_message_id: int, last_example_id: int) -> int:
         return 0
 
     try:
-        last_message_id, last_example_id = _normalize_state_ids(last_message_id, last_example_id)
+        last_message_id, last_example_id, last_feedback_id = _normalize_state_ids(
+            last_message_id, last_example_id, last_feedback_id
+        )
         conn = sqlite3.connect(str(db_path), timeout=10.0)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
@@ -307,10 +373,29 @@ def _count_new_items(last_message_id: int, last_example_id: int) -> int:
                 "SELECT COUNT(*) AS n FROM training_examples WHERE id > ? AND lower(COALESCE(source, '')) != 'upload'",
                 (int(last_example_id),),
             ).fetchone()
+        row3 = {"n": 0}
+        if _feedback_training_enabled():
+            try:
+                row3 = cur.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM model_feedback
+                    WHERE id > ?
+                      AND TRIM(COALESCE(prompt, '')) != ''
+                      AND (
+                        TRIM(COALESCE(corrected_response, '')) != ''
+                        OR (reward > 0 AND TRIM(COALESCE(response, '')) != '')
+                      )
+                    """,
+                    (int(last_feedback_id),),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row3 = {"n": 0}
         conn.close()
         n1 = int(row1["n"] if row1 else 0)
         n2 = int(row2["n"] if row2 else 0)
-        return n1 + n2
+        n3 = int(row3["n"] if row3 else 0)
+        return n1 + n2 + n3
     except Exception:
         return 0
 
@@ -472,6 +557,106 @@ def _load_recent_training_examples(*, max_pairs: int) -> Tuple[List[Tuple[str, s
         pairs = pairs[-max_pairs:]
 
     return pairs, max_ex_id
+
+
+
+
+def _load_recent_feedback_pairs(*, max_pairs: int) -> Tuple[List[Tuple[str, str]], int]:
+    """Load preferred (prompt, completion) pairs from explicit user feedback.
+
+    Corrections are preferred over original model responses. Positive feedback without
+    a correction uses the original model response. Negative-only feedback is retained
+    as a reward signal in the DB/hive memory, but is not used as a supervised target.
+    """
+
+    if not _feedback_training_enabled():
+        return [], 0
+
+    db_path = Path(settings.memory_db_path).expanduser()
+    if not db_path.exists():
+        return [], 0
+
+    limit_rows = max(200, int(max_pairs) * 3)
+    conn = sqlite3.connect(str(db_path), timeout=30.0)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    try:
+        rows = cur.execute(
+            """
+            SELECT id, target_type, prompt, response, corrected_response, comment, project_path, reward
+            FROM model_feedback
+            WHERE TRIM(COALESCE(prompt, '')) != ''
+              AND (
+                TRIM(COALESCE(corrected_response, '')) != ''
+                OR (reward > 0 AND TRIM(COALESCE(response, '')) != '')
+              )
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (int(limit_rows),),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return [], 0
+    conn.close()
+
+    if not rows:
+        return [], 0
+
+    rows = list(reversed(rows))
+    pairs: List[Tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    max_feedback_id = 0
+
+    try:
+        from app.feedback.rl import training_prompt_for_feedback
+    except Exception:
+        training_prompt_for_feedback = None  # type: ignore[assignment]
+
+    for r in rows:
+        fb_id = int(r["id"])
+        target_type = str(r["target_type"] or "qa").strip().lower()
+        prompt = str(r["prompt"] or "").strip()
+        corrected = str(r["corrected_response"] or "").strip()
+        response = str(r["response"] or "").strip()
+        comment = str(r["comment"] or "").strip()
+        project_path = str(r["project_path"] or "").strip()
+        try:
+            reward = float(r["reward"] or 0.0)
+        except Exception:
+            reward = 0.0
+        completion = corrected or (response if reward > 0 else "")
+        if not prompt or not completion:
+            continue
+        if _looks_bad_training_text(prompt) or _looks_bad_training_text(completion):
+            continue
+        if len(prompt) > 8000 or len(completion) > 12000:
+            continue
+        if training_prompt_for_feedback is not None:
+            try:
+                prompt_for_training = training_prompt_for_feedback(
+                    target_type=target_type,
+                    prompt=prompt,
+                    comment=comment,
+                    project_path=project_path,
+                )
+            except Exception:
+                prompt_for_training = prompt
+        else:
+            prompt_for_training = prompt
+        if _looks_bad_training_text(prompt_for_training):
+            continue
+        key = _pair_key(prompt_for_training, completion)
+        if key in seen:
+            continue
+        seen.add(key)
+        pairs.append((prompt_for_training, completion))
+        max_feedback_id = max(max_feedback_id, fb_id)
+
+    if len(pairs) > max_pairs:
+        pairs = pairs[-max_pairs:]
+
+    return pairs, max_feedback_id
 
 
 
@@ -748,10 +933,10 @@ def main() -> int:
         return 2
 
     state = _load_training_state_payload()
-    last_msg_id, last_ex_id = _load_training_state()
-    last_msg_id, last_ex_id = _normalize_state_ids(last_msg_id, last_ex_id)
+    last_msg_id, last_ex_id, last_fb_id = _load_training_state()
+    last_msg_id, last_ex_id, last_fb_id = _normalize_state_ids(last_msg_id, last_ex_id, last_fb_id)
     min_new = max(1, int(getattr(settings, "local_training_min_new_pairs", 25) or 25))
-    n_new = _count_new_items(last_msg_id, last_ex_id)
+    n_new = _count_new_items(last_msg_id, last_ex_id, last_fb_id)
 
     previous_pairs_used = 0
     previous_base_pairs_used = 0
@@ -772,16 +957,22 @@ def main() -> int:
     max_pairs = max(50, int(getattr(settings, "local_training_max_pairs", 1500) or 1500))
     conv_pairs, max_assistant_id = _load_recent_conversation_pairs(max_pairs=max_pairs)
     ex_pairs, max_example_id = _load_recent_training_examples(max_pairs=max_pairs)
+    feedback_pairs, max_feedback_id = _load_recent_feedback_pairs(max_pairs=max_pairs)
+    feedback_weight = _feedback_weight() if feedback_pairs else 1
+    weighted_feedback_pairs: List[Tuple[str, str]] = []
+    for pair in feedback_pairs:
+        weighted_feedback_pairs.extend([pair] * feedback_weight)
 
-    all_pairs = conv_pairs + ex_pairs
+    all_pairs = conv_pairs + ex_pairs + weighted_feedback_pairs
     if len(all_pairs) > max_pairs:
         all_pairs = all_pairs[-max_pairs:]
 
-    if len(all_pairs) < 10:
-        log.info("Not enough training pairs to train (found=%s)", len(all_pairs))
+    min_pairs = max(1, int(getattr(settings, "local_training_min_pairs", 1) or 1))
+    if len(all_pairs) < min_pairs:
+        log.info("Not enough training pairs to train (found=%s, required=%s)", len(all_pairs), min_pairs)
         return 0
 
-    base_target_pairs = max(10, previous_base_pairs_used or min_new)
+    base_target_pairs = max(min_pairs, previous_base_pairs_used or min_new)
     base_target_pairs = min(base_target_pairs, max_pairs)
     pairs, rolling_window_stats = _build_weighted_rolling_window(all_pairs, base_length=base_target_pairs)
 
@@ -820,8 +1011,29 @@ def main() -> int:
     use_cuda = device.startswith("cuda") and torch.cuda.is_available()
     model_id = getattr(settings, "local_training_model", None) or settings.local_llm_model
 
+    if use_cuda:
+        try:
+            idx = _cuda_index(device)
+            props = torch.cuda.get_device_properties(idx)
+            torch.cuda.set_device(idx)
+            log.info(
+                "Local training CUDA selected: %s | %s | total_vram=%s MiB",
+                device,
+                getattr(props, "name", "CUDA GPU"),
+                int(getattr(props, "total_memory", 0) or 0) // (1024 * 1024),
+            )
+        except Exception as e:
+            log.warning("Training CUDA was selected but diagnostics/setup failed for %s: %s", device, e)
+    else:
+        log.warning(
+            "Local training will run on CPU (configured=%s, resolved=%s, cuda_available=%s).",
+            getattr(settings, "local_training_device", "auto"),
+            device,
+            bool(torch.cuda.is_available()),
+        )
+
     log.info(
-        "Training local LoRA adapter | model=%s | device=%s | weighted_pairs=%s | base_window=%s | A=%s | B=%s | C=%s | recent_pairs=%s (conv=%s, extra=%s, include_upload_examples=%s, new_items=%s, previous_pairs_used=%s, previous_base_pairs_used=%s)",
+        "Training local LoRA adapter | model=%s | device=%s | weighted_pairs=%s | base_window=%s | A=%s | B=%s | C=%s | recent_pairs=%s (conv=%s, extra=%s, feedback_raw=%s, feedback_weight=%s, include_upload_examples=%s, new_items=%s, previous_pairs_used=%s, previous_base_pairs_used=%s)",
         model_id,
         device,
         len(pairs),
@@ -832,13 +1044,15 @@ def main() -> int:
         len(all_pairs),
         len(conv_pairs),
         len(ex_pairs),
+        len(feedback_pairs),
+        feedback_weight,
         _include_upload_examples(),
         n_new,
         previous_pairs_used,
         previous_base_pairs_used,
     )
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments, Trainer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments, Trainer, TrainerCallback
 
     class _SingleDeviceTrainer(Trainer):
         """Keep training on the already-selected CUDA device instead of DataParallel.
@@ -873,38 +1087,120 @@ def main() -> int:
 
         def training_step(self, model, inputs):  # type: ignore[override]
             loss = super().training_step(model, inputs)
-            if bool(getattr(settings, "local_training_abort_on_nonfinite", True)):
+
+            # On consumer CUDA cards, especially with partially-FP16 model loads, a
+            # single bad/overlong batch can produce NaN/Inf on the first step. The
+            # default behavior here is to skip that batch after clearing gradients so
+            # a manual RLHF run does not die immediately. Set
+            # LOCAL_TRAINING_ABORT_ON_NONFINITE=true and
+            # LOCAL_TRAINING_SKIP_NONFINITE_BATCHES=false to restore fail-fast behavior.
+            abort_env = os.getenv("LOCAL_TRAINING_ABORT_ON_NONFINITE", "").strip().lower()
+            abort_on_nonfinite = bool(
+                abort_env in {"1", "true", "yes", "on"}
+                or (
+                    not abort_env
+                    and bool(getattr(settings, "local_training_abort_on_nonfinite", False))
+                )
+            )
+            skip_nonfinite = bool(
+                os.getenv("LOCAL_TRAINING_SKIP_NONFINITE_BATCHES", "true").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+
+            def _clear_bad_grads() -> None:
                 try:
-                    if isinstance(loss, torch.Tensor) and not torch.isfinite(loss.detach()).all():
-                        raise RuntimeError(
-                            "Non-finite training loss encountered. The forward pass produced NaN/Inf loss; use BF16 or FP32 base weights and ensure training inputs are on the selected GPU."
+                    model.zero_grad(set_to_none=True)
+                except TypeError:
+                    try:
+                        model.zero_grad()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                opt = getattr(self, "optimizer", None)
+                if opt is not None:
+                    try:
+                        opt.zero_grad(set_to_none=True)
+                    except TypeError:
+                        try:
+                            opt.zero_grad()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
+
+            if isinstance(loss, torch.Tensor):
+                try:
+                    if not torch.isfinite(loss.detach()).all():
+                        msg = (
+                            "Non-finite training loss encountered. Clearing gradients "
+                            "and skipping this batch. For RTX 3060 stability this worker "
+                            "now defaults to FP32 base weights unless FP16/BF16 is explicitly requested."
                         )
+                        if abort_on_nonfinite and not skip_nonfinite:
+                            raise RuntimeError(msg)
+                        _clear_bad_grads()
+                        log.warning("%s", msg)
+                        return loss.detach().new_zeros(())
                 except RuntimeError:
                     raise
                 except Exception:
                     pass
-                saw_grad = False
-                bad_name = None
-                for name, param in model.named_parameters():
-                    if not getattr(param, "requires_grad", False):
-                        continue
-                    grad = getattr(param, "grad", None)
-                    if grad is None:
-                        continue
-                    saw_grad = True
-                    try:
-                        if not torch.isfinite(grad.detach()).all():
-                            bad_name = name
-                            break
-                    except Exception:
-                        continue
-                if bad_name is not None:
-                    raise RuntimeError(f"Non-finite gradient detected in trainable parameter: {bad_name}")
-                if not saw_grad:
-                    raise RuntimeError(
-                        "No trainable gradients were produced. For LoRA training this usually means gradient checkpointing is on without input grads enabled."
-                    )
+
+            saw_grad = False
+            bad_name = None
+            for name, param in model.named_parameters():
+                if not getattr(param, "requires_grad", False):
+                    continue
+                grad = getattr(param, "grad", None)
+                if grad is None:
+                    continue
+                saw_grad = True
+                try:
+                    if not torch.isfinite(grad.detach()).all():
+                        bad_name = name
+                        break
+                except Exception:
+                    continue
+            if bad_name is not None:
+                msg = f"Non-finite gradient detected in trainable parameter: {bad_name}"
+                if abort_on_nonfinite and not skip_nonfinite:
+                    raise RuntimeError(msg)
+                _clear_bad_grads()
+                log.warning("%s; skipped batch and cleared gradients.", msg)
+                if isinstance(loss, torch.Tensor):
+                    return loss.detach().new_zeros(())
+            if not saw_grad:
+                raise RuntimeError(
+                    "No trainable gradients were produced. For LoRA training this usually means gradient checkpointing is on without input grads enabled."
+                )
             return loss
+
+    class _TrainingProgressCallback(TrainerCallback):
+        """Emit plain log lines in addition to tqdm so PowerShell always shows progress."""
+
+        def on_train_begin(self, args, state, control, **kwargs):  # type: ignore[override]
+            log.info("Starting trainer.train() | max_steps=%s | logging_steps=%s", args.max_steps, args.logging_steps)
+
+        def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
+            if not logs:
+                return
+            clean = {
+                k: (round(float(v), 6) if isinstance(v, (float, int)) else v)
+                for k, v in dict(logs).items()
+                if k in {"loss", "learning_rate", "grad_norm", "epoch"}
+            }
+            if clean:
+                log.info("Training progress | step=%s/%s | %s", state.global_step, state.max_steps, clean)
+
+        def on_train_end(self, args, state, control, **kwargs):  # type: ignore[override]
+            log.info("Trainer finished | global_step=%s | max_steps=%s", state.global_step, state.max_steps)
+
 
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
@@ -917,24 +1213,54 @@ def main() -> int:
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
-    requested_fp16 = bool(use_cuda and getattr(settings, "local_training_use_amp", False))
-    requested_bf16 = bool(use_cuda and getattr(settings, "local_training_bf16", False))
+    fp16_env = os.getenv("LOCAL_TRAINING_FP16", "").strip().lower()
+    bf16_env = os.getenv("LOCAL_TRAINING_BF16", "").strip().lower()
+    stable_fp32_env = os.getenv("LOCAL_TRAINING_STABLE_FP32", "true").strip().lower()
+
+    # Important RTX 3060 fix:
+    # The previous worker loaded Qwen in FP16 by default but did not enable AMP
+    # (Trainer fp16=False). That combination produced NaN/Inf loss on step 0 in
+    # your run. Default to FP32 base weights for stable LoRA training. Opt in to
+    # FP16/BF16 explicitly through env/settings if you want to experiment later.
+    prefer_stable_fp32 = stable_fp32_env not in {"0", "false", "no", "off"}
+
+    requested_bf16 = bool(
+        use_cuda
+        and (
+            bf16_env in {"1", "true", "yes", "on"}
+            or bool(getattr(settings, "local_training_bf16", False))
+        )
+    )
+    requested_fp16 = bool(
+        use_cuda
+        and not prefer_stable_fp32
+        and (
+            fp16_env in {"1", "true", "yes", "on"}
+            or bool(getattr(settings, "local_training_fp16", False))
+            or bool(getattr(settings, "local_training_use_amp", False))
+        )
+    )
     bf16_supported = bool(use_cuda and _cuda_supports_bf16(device))
-    auto_bf16 = bool(use_cuda and not requested_fp16 and not requested_bf16 and bf16_supported)
+
     if requested_bf16 and not bf16_supported:
-        log.warning("BF16 requested but not supported on %s; falling back to FP16 or FP32 base weights.", device)
-    if auto_bf16:
-        log.info("Auto-enabling BF16 for local LoRA training on %s for better stability than pure FP16.", device)
-    use_bf16 = bool((requested_bf16 or auto_bf16) and bf16_supported)
+        log.warning("BF16 requested but not supported on %s; falling back to FP32 base weights.", device)
+
+    use_bf16 = bool(requested_bf16 and bf16_supported)
     use_fp16 = bool(requested_fp16 and not use_bf16)
-    force_fp16_base = bool(use_cuda and getattr(settings, "local_training_force_fp16_base", True))
-    auto_fp16_base = bool(use_cuda and not use_bf16 and force_fp16_base)
-    if auto_fp16_base and not use_fp16:
+
+    if use_bf16:
+        base_dtype = torch.bfloat16
+        log.info("Using BF16 base weights and BF16 Trainer path on %s because BF16 was explicitly requested.", device)
+    elif use_fp16:
+        base_dtype = torch.float16
+        log.info("Using FP16 base weights and FP16 Trainer path on %s because FP16 was explicitly requested.", device)
+    else:
+        base_dtype = torch.float32
         log.info(
-            "Using FP16 base weights for local LoRA training on %s to stay within consumer GPU VRAM; LoRA trainable weights stay FP32.",
+            "Using FP32 base weights for stable local LoRA training on %s. This avoids first-step NaN/Inf loss seen with FP16 base weights on this setup.",
             device,
         )
-    base_dtype = torch.bfloat16 if use_bf16 else (torch.float16 if (use_fp16 or auto_fp16_base) else torch.float32)
+
     use_amp = bool(use_fp16 or use_bf16)
 
     quant_cfg = None
@@ -1033,9 +1359,17 @@ def main() -> int:
         tok_vocab = int(len(tok))
         emb = model.get_input_embeddings()
         model_vocab = int(getattr(getattr(emb, "weight", None), "shape", [0])[0] or 0)
-        if tok_vocab > 0 and model_vocab > 0 and tok_vocab != model_vocab:
-            log.info("Resizing token embeddings to match tokenizer vocab: %s -> %s", model_vocab, tok_vocab)
+        if tok_vocab > 0 and model_vocab > 0 and tok_vocab > model_vocab:
+            log.info("Growing token embeddings to match tokenizer vocab: %s -> %s", model_vocab, tok_vocab)
             model.resize_token_embeddings(tok_vocab)
+        elif tok_vocab > 0 and model_vocab > 0 and tok_vocab < model_vocab:
+            # Qwen checkpoints often keep a padded embedding matrix. Shrinking it is
+            # unnecessary and can destabilize tied lm_head/embedding behavior.
+            log.info(
+                "Tokenizer vocab (%s) is smaller than model embeddings (%s); keeping model embeddings unchanged.",
+                tok_vocab,
+                model_vocab,
+            )
     except Exception as e:
         log.warning("Failed to verify/resize token embeddings: %s", e)
 
@@ -1127,8 +1461,13 @@ def main() -> int:
         )
         train_max_len = 512
     dataset = _PairsDataset(pairs=pairs, tokenizer=tok, system_prompt=DEFAULT_SYSTEM_PROMPT, max_len=train_max_len)
-    if len(dataset) < 10:
-        log.info("Not enough usable training samples after filtering/truncation (usable=%s, raw_pairs=%s)", len(dataset), len(pairs))
+    if len(dataset) < min_pairs:
+        log.info(
+            "Not enough usable training samples after filtering/truncation (usable=%s, raw_pairs=%s, required=%s)",
+            len(dataset),
+            len(pairs),
+            min_pairs,
+        )
         return 0
 
     stats = _dataset_target_stats(dataset)
@@ -1165,12 +1504,15 @@ def main() -> int:
 
     arg_kwargs = dict(
         output_dir=str(run_dir),
+        disable_tqdm=False,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=8,
         max_steps=max_steps,
         learning_rate=lr,
         warmup_steps=0,
-        logging_steps=10,
+        logging_strategy="steps",
+        logging_first_step=True,
+        logging_steps=1,
         save_strategy="no",
         report_to=[],
         remove_unused_columns=False,
@@ -1198,21 +1540,56 @@ def main() -> int:
         except Exception:
             pass
 
+    log.info(
+        "TrainingArguments ready | output_dir=%s | max_steps=%s | logging_steps=%s | fp16=%s | bf16=%s | tqdm=%s",
+        run_dir,
+        max_steps,
+        arg_kwargs.get("logging_steps"),
+        bool(use_fp16),
+        bool(use_bf16),
+        not bool(arg_kwargs.get("disable_tqdm")),
+    )
+
+    log.info("Building Trainer now...")
     trainer = _SingleDeviceTrainer(
         model=model,
         args=args,
         train_dataset=dataset,
         data_collator=lambda batch: _collate(tok, batch),
+        callbacks=[_TrainingProgressCallback()],
     )
 
-    trainer.train()
+    log.info("Calling trainer.train() now...")
+    train_result = trainer.train()
+    try:
+        log.info("Training complete: %s", getattr(train_result, "metrics", train_result))
+    except Exception:
+        log.info("Training complete.")
 
     # Save adapter (PEFT) + tokenizer for reproducibility.
+    log.info("Saving LoRA adapter run to %s", run_dir)
     model.save_pretrained(str(run_dir))
     try:
         tok.save_pretrained(str(run_dir))
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Failed saving tokenizer to %s: %s", run_dir, e)
+
+    try:
+        metadata = {
+            "schema_version": 1,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "base_model_name_or_path": str(model_id),
+            "adapter_type": "lora",
+            "memory_db_path": str(Path(settings.memory_db_path).expanduser()),
+            "memory_db_exists": bool(Path(settings.memory_db_path).expanduser().exists()),
+            "pairs_used": len(pairs),
+            "pairs_used_conv": len(conv_pairs),
+            "pairs_used_extra": len(ex_pairs),
+            "feedback_weight": feedback_weight,
+        }
+        (run_dir / "adapter_metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    except Exception as e:
+        log.warning("Failed writing adapter metadata to %s: %s", run_dir, e)
 
     # Atomically update the "latest" adapter directory.
     latest = resolve_model_adapter_dir(settings.local_llm_adapter_dir, model_id)
@@ -1224,6 +1601,7 @@ def main() -> int:
         if latest.exists():
             shutil.rmtree(latest)
         tmp.rename(latest)
+        log.info("Updated latest LoRA adapter directory: %s", latest)
     except Exception as e:
         log.warning("Failed updating latest adapter dir (%s): %s", latest, e)
 
@@ -1231,6 +1609,9 @@ def main() -> int:
         "pairs_used": len(pairs),
         "pairs_used_conv": len(conv_pairs),
         "pairs_used_extra": len(ex_pairs),
+        "pairs_used_feedback_raw": len(feedback_pairs),
+        "feedback_weight": feedback_weight,
+        "feedback_training_enabled": _feedback_training_enabled(),
         "include_upload_examples": _include_upload_examples(),
         "new_items_since_last": n_new,
         "rolling_window_pairs": len(pairs),
@@ -1246,8 +1627,14 @@ def main() -> int:
         "max_steps": max_steps,
         "learning_rate": lr,
         "adapter_run_dir": str(run_dir),
+        "max_feedback_id": max_feedback_id or last_fb_id,
     }
-    _write_state(last_message_id=max_assistant_id or last_msg_id, last_training_example_id=max_example_id or last_ex_id, stats=train_stats)
+    _write_state(
+        last_message_id=max_assistant_id or last_msg_id,
+        last_training_example_id=max_example_id or last_ex_id,
+        last_feedback_id=max_feedback_id or last_fb_id,
+        stats=train_stats,
+    )
     log.info("Training complete. Updated adapter in %s", latest)
     return 0
 

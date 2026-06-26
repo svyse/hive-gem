@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from app.agents.base import BaseAgent
 from app.core.config import settings
+from app.llm.factory import active_backend
 from app.utils.sequence_learning import (
     QueryTraceRecorder,
     extract_sequence_traces_from_memories,
@@ -205,7 +206,8 @@ class DomainOrchestratorBase(BaseAgent):
                 purpose="sequence_learning_scan",
             )
             recent = self.ctx.memory_store.recent_all(limit=scan_limit, scopes=["type", "hive"])
-            parsed = extract_sequence_traces_from_memories(recent)
+            #parsed = extract_sequence_traces_from_memories(recent)
+            parsed = []
         except Exception as e:
             return {"enabled": False, "error": str(e)}
 
@@ -335,7 +337,7 @@ class DomainOrchestratorBase(BaseAgent):
                 if "workspace_module" not in base_agent_types:
                     base_agent_types.append("workspace_module")
 
-            is_local_backend = str(getattr(settings, "llm_backend", "") or "").strip().lower() == "local"
+            is_local_backend = str(active_backend() or "").strip().lower() == "local"
 
             recommended = []
             if (not is_local_backend) and isinstance(seq_ctx, dict):
@@ -659,10 +661,9 @@ class DomainOrchestratorBase(BaseAgent):
                 local_refs = {"error": str(e)}
 
         web_research: Any = None
-        llm_client = getattr(getattr(self, "ctx", None), "llm", None)
-        active_backend = str(getattr(llm_client, "backend", getattr(settings, "llm_backend", "local")) or "local").lower()
+        effective_backend = str(active_backend() or getattr(settings, "llm_backend", "local") or "local").strip().lower()
         local_web_allowed = bool(getattr(settings, "local_qa_web_research_enabled", False))
-        if use_web and settings.web_research_enabled and self.ctx.registry is not None and (active_backend != "local" or local_web_allowed):
+        if use_web and settings.web_research_enabled and self.ctx.registry is not None and (effective_backend != "local" or local_web_allowed):
             # Web research is best-effort: failures (timeouts, DB locks, etc.)
             # must not crash the orchestrator turn.
             queries = [question]
@@ -727,7 +728,7 @@ class DomainOrchestratorBase(BaseAgent):
                         self._trace_event("agent_terminate", agent_type="web_research")
                     except Exception:
                         pass
-        elif use_web and settings.web_research_enabled and active_backend == "local" and not local_web_allowed:
+        elif use_web and settings.web_research_enabled and effective_backend == "local" and not local_web_allowed:
             web_research = {
                 "enabled": False,
                 "skipped": "disabled_for_local_backend",

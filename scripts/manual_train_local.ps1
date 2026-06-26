@@ -4,8 +4,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-Set-Location $RepoRoot
+Set-Location (Join-Path $RepoRoot "backend")
 
-$argsList = @()
-if ($Force) { $argsList += "--force" }
-python .\scripts\manual_train_local.py @argsList
+$env:PYTORCH_CUDA_ALLOC_CONF = if ($env:PYTORCH_CUDA_ALLOC_CONF) { $env:PYTORCH_CUDA_ALLOC_CONF } else { "expandable_segments:True" }
+$env:CUDA_VISIBLE_DEVICES = "0"
+if ($Force) { $env:FORCE_TRAIN = "1" }
+
+python -m app.training.worker

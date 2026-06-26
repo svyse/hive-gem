@@ -252,16 +252,24 @@ class Settings(BaseSettings):
     local_llm_model: str = Field(
         # Better default local model (small enough for RTX 3060 12GB with FP16 or CPU offload).
         # You can override this in .env via LOCAL_LLM_MODEL.
-        default="Qwen/Qwen2.5-Coder-3B-Instruct",
+        default="Qwen/Qwen2.5-Coder-1.5B-Instruct",
         alias="LOCAL_LLM_MODEL",
         description="Hugging Face model id or local path.",
     )
-    local_llm_device: str = Field(default="auto", alias="LOCAL_LLM_DEVICE")
+    local_llm_device: str = Field(default="cuda:0", alias="LOCAL_LLM_DEVICE")
+    cuda_visible_devices: str = Field(default="0", alias="CUDA_VISIBLE_DEVICES")
     local_llm_max_new_tokens: int = Field(default=384, alias="LOCAL_LLM_MAX_NEW_TOKENS")
     local_llm_temperature: float = Field(default=0.2, alias="LOCAL_LLM_TEMPERATURE")
     local_llm_top_p: float = Field(default=0.95, alias="LOCAL_LLM_TOP_P")
     local_llm_top_k: int = Field(default=50, alias="LOCAL_LLM_TOP_K")
-    local_llm_repetition_penalty: float = Field(default=1.05, alias="LOCAL_LLM_REPETITION_PENALTY")
+    local_llm_do_sample: bool = Field(default=True, alias="LOCAL_LLM_DO_SAMPLE")
+    local_llm_repetition_penalty: float = Field(default=1.25, alias="LOCAL_LLM_REPETITION_PENALTY")
+    local_llm_no_repeat_ngram_size: int = Field(default=6, alias="LOCAL_LLM_NO_REPEAT_NGRAM_SIZE")
+    local_llm_repeat_stop_enabled: bool = Field(default=True, alias="LOCAL_LLM_REPEAT_STOP_ENABLED")
+    local_llm_repeat_stop_min_tokens: int = Field(default=20, alias="LOCAL_LLM_REPEAT_STOP_MIN_TOKENS")
+    local_llm_repeat_token_limit: int = Field(default=10, alias="LOCAL_LLM_REPEAT_TOKEN_LIMIT")
+    local_llm_repeat_ngram_limit: int = Field(default=4, alias="LOCAL_LLM_REPEAT_NGRAM_LIMIT")
+    local_llm_repeat_max_ngram: int = Field(default=8, alias="LOCAL_LLM_REPEAT_MAX_NGRAM")
     local_llm_load_in_4bit: bool = Field(default=True, alias="LOCAL_LLM_LOAD_IN_4BIT")
     # Some models (rare) require `trust_remote_code=True`. Default is False for safety
     # and to avoid 404s on repos that advertise custom modules but don't ship them.
@@ -279,11 +287,53 @@ class Settings(BaseSettings):
     )
     local_llm_concurrency: int = Field(default=1, alias="LOCAL_LLM_CONCURRENCY")
     # Purpose-specific caps keep local generations short enough for 12 GB GPUs.
-    local_llm_qa_max_new_tokens: int = Field(default=256, alias="LOCAL_LLM_QA_MAX_NEW_TOKENS")
-    local_llm_code_max_new_tokens: int = Field(default=384, alias="LOCAL_LLM_CODE_MAX_NEW_TOKENS")
-    local_llm_json_max_new_tokens: int = Field(default=256, alias="LOCAL_LLM_JSON_MAX_NEW_TOKENS")
-    local_llm_max_input_tokens: int = Field(default=3072, alias="LOCAL_LLM_MAX_INPUT_TOKENS")
+    local_llm_qa_max_new_tokens: int = Field(default=160, alias="LOCAL_LLM_QA_MAX_NEW_TOKENS")
+    local_llm_code_max_new_tokens: int = Field(default=256, alias="LOCAL_LLM_CODE_MAX_NEW_TOKENS")
+    # Project/file generation needs more room than strict JSON planning. This is
+    # used by the local code-engine path that creates full project structures
+    # from NLP prompts without requiring JSON output.
+    local_llm_code_project_max_new_tokens: int = Field(default=1024, alias="LOCAL_LLM_CODE_PROJECT_MAX_NEW_TOKENS")
+    local_llm_json_max_new_tokens: int = Field(default=192, alias="LOCAL_LLM_JSON_MAX_NEW_TOKENS")
+    local_llm_max_input_tokens: int = Field(default=2048, alias="LOCAL_LLM_MAX_INPUT_TOKENS")
     local_llm_empty_cache_after_generate: bool = Field(default=False, alias="LOCAL_LLM_EMPTY_CACHE_AFTER_GENERATE")
+
+    # Local code engine controls. This path asks the local model for normal
+    # manifest/file-content text instead of strict JSON so it can create and edit
+    # real project files from natural-language prompts.
+    local_code_engine_enabled: bool = Field(default=True, alias="LOCAL_CODE_ENGINE_ENABLED")
+    local_code_engine_max_files: int = Field(default=12, alias="LOCAL_CODE_ENGINE_MAX_FILES")
+    local_code_engine_max_context_files: int = Field(default=24, alias="LOCAL_CODE_ENGINE_MAX_CONTEXT_FILES")
+    local_code_engine_max_file_chars: int = Field(default=4500, alias="LOCAL_CODE_ENGINE_MAX_FILE_CHARS")
+    local_code_engine_repair_enabled: bool = Field(default=True, alias="LOCAL_CODE_ENGINE_REPAIR_ENABLED")
+    # Validate each generated file before writing it. This catches generic bad
+    # local-model output such as shell commands inside .py files, README prose in
+    # tests, or git/pip commands in requirements/ignore files.
+    local_code_engine_validate_files: bool = Field(default=True, alias="LOCAL_CODE_ENGINE_VALIDATE_FILES")
+    local_code_engine_file_retries: int = Field(default=2, alias="LOCAL_CODE_ENGINE_FILE_RETRIES")
+    # Legacy demo templates are opt-in only. The default code path uses the
+    # prompt-driven local code engine for every project type instead of
+    # hardcoding hello-world/calculator projects.
+    local_code_engine_deterministic_examples_enabled: bool = Field(
+        default=False, alias="LOCAL_CODE_ENGINE_DETERMINISTIC_EXAMPLES_ENABLED"
+    )
+    # Keep the old one-shot local file-block/JSON fallbacks disabled by default.
+    # They can turn code-fence guesses or commands into files such as file_1.java
+    # or python main.py when a small local model drifts.
+    local_code_engine_allow_legacy_nlp_fallback: bool = Field(
+        default=False, alias="LOCAL_CODE_ENGINE_ALLOW_LEGACY_NLP_FALLBACK"
+    )
+    # For create-project runs under sample_projects, remove failed generated
+    # artifacts from previous attempts before applying the new validated files.
+    local_code_engine_clean_new_project_artifacts: bool = Field(
+        default=True, alias="LOCAL_CODE_ENGINE_CLEAN_NEW_PROJECT_ARTIFACTS"
+    )
+    local_code_engine_clean_new_project_anywhere: bool = Field(
+        default=False, alias="LOCAL_CODE_ENGINE_CLEAN_NEW_PROJECT_ANYWHERE"
+    )
+    # Store compact lessons from failures/quality-gate rejections in .memory so
+    # future local code runs can retrieve and avoid the same mistakes.
+    local_code_learning_lessons_enabled: bool = Field(default=True, alias="LOCAL_CODE_LEARNING_LESSONS_ENABLED")
+    local_code_failure_max_chars: int = Field(default=12000, alias="LOCAL_CODE_FAILURE_MAX_CHARS")
 
 
     # Prefer the largest available CUDA GPU when device=auto.
@@ -303,7 +353,7 @@ class Settings(BaseSettings):
     local_training_enabled: bool = Field(default=False, alias="LOCAL_TRAINING_ENABLED")
     local_training_autostart: bool = Field(default=False, alias="LOCAL_TRAINING_AUTOSTART")
     local_training_poll_s: int = Field(default=900, alias="LOCAL_TRAINING_POLL_S")
-    local_training_device: str = Field(default="auto", alias="LOCAL_TRAINING_DEVICE")
+    local_training_device: str = Field(default="cuda:0", alias="LOCAL_TRAINING_DEVICE")
     local_training_model: Optional[str] = Field(default=None, alias="LOCAL_TRAINING_MODEL")
     # Some models require remote code for training as well. Default False.
     local_training_trust_remote_code: bool = Field(default=False, alias="LOCAL_TRAINING_TRUST_REMOTE_CODE")
@@ -372,6 +422,12 @@ class Settings(BaseSettings):
     code_training_max_examples_per_run: int = Field(default=8, alias="CODE_TRAINING_MAX_EXAMPLES_PER_RUN")
     code_training_max_chars: int = Field(default=12000, alias="CODE_TRAINING_MAX_CHARS")
 
+    # User feedback / RLHF-style learning. Feedback is stored immediately and
+    # consumed by the manual local LoRA trainer with extra weight so corrections
+    # influence the local model more strongly than passive chat logs.
+    feedback_training_enabled: bool = Field(default=True, alias="FEEDBACK_TRAINING_ENABLED")
+    local_training_feedback_weight: int = Field(default=4, alias="LOCAL_TRAINING_FEEDBACK_WEIGHT")
+
     # ------------------------------
     # Agent spawn limits
     # ------------------------------
@@ -388,9 +444,16 @@ class Settings(BaseSettings):
     web_fetch_top_n: int = Field(default=3, alias="WEB_FETCH_TOP_N")
     web_request_timeout_s: float = Field(default=12.0, alias="WEB_REQUEST_TIMEOUT_S")
     web_user_agent: str = Field(default="AgenticHiveBot/0.1", alias="WEB_USER_AGENT")
-    # Local Q&A/code should not spend extra time spawning web agents unless explicitly enabled.
+    # Local Q&A/code web research controls. Q&A remains opt-in; code mode is
+    # enabled by default because coding prompts benefit from current docs and
+    # examples. Failures are handled as optional context and never stop local
+    # generation.
     local_qa_web_research_enabled: bool = Field(default=False, alias="LOCAL_QA_WEB_RESEARCH_ENABLED")
-    local_code_web_research_enabled: bool = Field(default=False, alias="LOCAL_CODE_WEB_RESEARCH_ENABLED")
+    local_code_web_research_enabled: bool = Field(default=True, alias="LOCAL_CODE_WEB_RESEARCH_ENABLED")
+    local_code_web_research_max_queries: int = Field(default=3, alias="LOCAL_CODE_WEB_RESEARCH_MAX_QUERIES")
+    local_code_web_research_timeout_s: float = Field(default=25.0, alias="LOCAL_CODE_WEB_RESEARCH_TIMEOUT_S")
+    local_code_web_research_max_context_chars: int = Field(default=5000, alias="LOCAL_CODE_WEB_RESEARCH_MAX_CONTEXT_CHARS")
+    local_code_web_research_llm_summary_enabled: bool = Field(default=False, alias="LOCAL_CODE_WEB_RESEARCH_LLM_SUMMARY_ENABLED")
 
     orchestrator_scale_threshold: int = Field(default=6, alias="ORCH_SCALE_THRESHOLD")
     orchestrator_query_batch_size: int = Field(default=4, alias="ORCH_QUERY_BATCH_SIZE")
@@ -413,7 +476,21 @@ class Settings(BaseSettings):
     # Command Agent safety
     # ------------------------------
     command_allowlist: List[str] = Field(
-        default_factory=lambda: ["python", "pytest", "pip", "uvicorn", "git", "docker"],
+        default_factory=lambda: [
+            "python",
+            "python3",
+            "py",
+            "pytest",
+            "pip",
+            "uvicorn",
+            "git",
+            "docker",
+            "node",
+            "npm",
+            "npx",
+            "go",
+            "cargo",
+        ],
         alias="COMMAND_ALLOWLIST",
     )
     docker_exec_disabled: bool = Field(default=True, alias="DOCKER_EXEC_DISABLED")

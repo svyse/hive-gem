@@ -3,10 +3,19 @@
 const API_BASE = import.meta.env.VITE_API_BASE || ''
 
 async function httpJson(path, options = {}) {
+  const { timeoutMs = 0, ...fetchOptions } = options || {}
+  const controller = timeoutMs > 0 ? new AbortController() : null
+  let timer = null
+  if (controller) {
+    timer = window.setTimeout(() => controller.abort(), timeoutMs)
+  }
+
   try {
     const res = await fetch(`${API_BASE}${path}`, {
-      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-      ...options
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json', ...(fetchOptions.headers || {}) },
+      ...fetchOptions,
+      ...(controller ? { signal: controller.signal } : {})
     })
     if (!res.ok) {
       const txt = await res.text()
@@ -14,14 +23,20 @@ async function httpJson(path, options = {}) {
     }
     return await res.json()
   } catch (e) {
-    // Fetch throws a TypeError on network/proxy/CORS failures.
+    // Fetch throws a TypeError on network/proxy/CORS failures. AbortError means
+    // the backend did not respond within the explicit timeout for this action.
     const msg = String(e?.message || e)
+    if (e?.name === 'AbortError') {
+      throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s: ${path}`)
+    }
     if (msg.toLowerCase().includes('failed to fetch') || msg.toLowerCase().includes('networkerror')) {
       throw new Error(
         `${msg}. Backend might be offline. Make sure FastAPI is running (default: http://127.0.0.1:8000) and that the frontend proxy/CORS is configured.`
       )
     }
     throw e
+  } finally {
+    if (timer) window.clearTimeout(timer)
   }
 }
 
@@ -32,21 +47,63 @@ export async function createRun({ project_path, prompt, copy_project_to_workspac
   })
 }
 
+export async function createRunWithDocument({
+  project_path,
+  prompt,
+  file,
+  copy_project_to_workspace = false,
+  input_mode = 'text'
+}) {
+  const fd = new FormData()
+  fd.append('project_path', project_path)
+  fd.append('prompt', prompt)
+  fd.append('copy_project_to_workspace', String(!!copy_project_to_workspace))
+  fd.append('input_mode', input_mode || 'text')
+  fd.append('file', file)
 
+  const res = await fetch(`${API_BASE}/api/runs/with-document`, {
+    method: 'POST',
+    body: fd
+  })
 
-// ------------------------------
-// Runtime LLM backend switching
-// ------------------------------
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '')
+    throw new Error(txt || `Run with document failed (${res.status})`)
+  }
 
-export async function getModelBackend() {
-  return await httpJson('/api/model/backend')
+  return await res.json()
 }
 
-export async function setModelBackend(backend) {
-  return await httpJson('/api/model/backend', {
+
+
+// Startup-only provider selection: edit backend/.env LLM_BACKEND and restart FastAPI.
+// Runtime dashboard hot-swap is intentionally disabled.
+export async function getModelBackend() {
+  return await httpJson('/api/model/backend', { timeoutMs: 5000 })
+}
+
+export async function setModelBackend(_backend) {
+  return await getModelBackend()
+}
+
+// ------------------------------
+// Model feedback / RLHF
+// ------------------------------
+
+export async function submitModelFeedback(payload = {}) {
+  return await httpJson('/api/feedback', {
     method: 'POST',
-    body: JSON.stringify({ backend })
+    body: JSON.stringify(payload)
   })
+}
+
+export async function getFeedbackStats() {
+  return await httpJson('/api/feedback/stats', { timeoutMs: 10000 })
+}
+
+export async function getLocalStatus({ deep = false } = {}) {
+  const qs = deep ? '?deep=true' : ''
+  return await httpJson(`/api/local/status${qs}`, { timeoutMs: deep ? 30000 : 5000 })
 }
 
 export async function askQA({

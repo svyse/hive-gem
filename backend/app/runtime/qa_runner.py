@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.memory.store import get_memory_store
 from app.runtime.bus import MessageBus
 from app.runtime.project_paths import resolve_project_path
+from app.llm.factory import active_backend
 
 import traceback
 
@@ -39,6 +40,11 @@ _ERRORISH_ANSWER_PHRASES = (
     "please check the run log for details",
     "could not parse json from model output",
     "q&a agent output must be json object",
+    "repeated-token loop",
+    "repeated token",
+    "generation collapsed",
+    "generated repeated-token output",
+    "skipped generated operations because the local model repeated tokens",
 )
 
 
@@ -217,7 +223,8 @@ async def run_qa(
         except Exception as e:
             run_logger(f"logging agent unavailable: {e}")
 
-        run_logger(f"Q&A turn started: {turn_id} (conversation_id={conversation_id})")
+        effective_backend = active_backend()
+        run_logger(f"Q&A turn started: {turn_id} (conversation_id={conversation_id}, backend={effective_backend})")
         if project_root:
             run_logger(f"project_root: {project_root}")
 
@@ -248,6 +255,8 @@ async def run_qa(
                 conversation_history=conversation_history,
             )
             result = result_any if isinstance(result_any, dict) else {"answer": str(result_any)}
+            if isinstance(result, dict):
+                result.setdefault("backend", active_backend())
         except (Exception, asyncio.CancelledError) as e:
             # NOTE: asyncio.CancelledError inherits from BaseException on Py3.11.
             # We catch it explicitly so a cancelled task doesn't explode into a
@@ -261,6 +270,7 @@ async def run_qa(
                 "question": question,
                 "answer": "Internal error while answering. Please check the run log for details.",
                 "error": f"{type(e).__name__}: {e}",
+                "backend": active_backend(),
             }
 
         # Persist assistant message into conversation store

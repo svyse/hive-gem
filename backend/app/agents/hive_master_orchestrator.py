@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from app.agents.domain_orchestrator_base import DomainOrchestratorBase, _uniq
 from app.core.config import settings
+from app.llm.factory import active_backend
 from app.utils.sequence_learning import (
     extract_sequence_traces_from_memories,
     merge_preferred_order,
@@ -218,7 +219,7 @@ class HiveMasterOrchestrator(DomainOrchestratorBase):
 
             # Sequence-learning routing adjustment (optional)
             learning = self._orchestrator_learning_context(question=question)
-            is_local_backend = str(getattr(settings, "llm_backend", "") or "").strip().lower() == "local"
+            is_local_backend = str(active_backend() or "").strip().lower() == "local"
             recommended = []
             if (not is_local_backend) and (not target_orchestrator) and isinstance(learning, dict):
                 recommended = [str(x) for x in (learning.get("recommended_orchestrators") or []) if str(x).strip()]

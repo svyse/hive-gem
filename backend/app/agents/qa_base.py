@@ -6,6 +6,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from app.agents.base import BaseAgent
+from app.llm.factory import active_backend
 
 
 def _safe_list(x: Any) -> List[Any]:
@@ -59,10 +60,64 @@ FOLLOWUPS:
 CONFIDENCE: low|medium|high
 
 Do not use markdown code fences. Keep the headings exactly as written above.
+For simple code-generation questions, put only the code in ANSWER, leave KEY POINTS and FOLLOWUPS empty, and do not add explanations.
 """
 
 
-def _parse_structured_text_answer(text: str) -> Dict[str, Any]:
+_HEADING_RE = re.compile(
+    r"^\s*(answer|key\s*points?|key\s*point|follow\s*ups?|followups?|confidence|confidenlty)\s*(?::|-)?\s*(.*)$",
+    re.IGNORECASE,
+)
+
+
+def _heading_kind(line: str) -> tuple[Optional[str], str]:
+    m = _HEADING_RE.match(line or "")
+    if not m:
+        return None, ""
+    label = re.sub(r"[^a-z]", "", m.group(1).lower())
+    tail = (m.group(2) or "").strip()
+    if label.startswith("answer"):
+        return "answer", tail
+    if label.startswith("keypoint"):
+        return "key_points", tail
+    if label.startswith("followup"):
+        return "followups", tail
+    if label.startswith("confidence") or label.startswith("confidenlty"):
+        return "confidence", tail
+    return None, ""
+
+
+def _strip_list_marker(text: str) -> str:
+    return re.sub(r"^(?:[-*+]\s*|\d+[.)]\s*)", "", str(text or "").strip()).strip()
+
+
+def _looks_like_simple_code_question(question: str | None) -> bool:
+    q = re.sub(r"\s+", " ", str(question or "").strip().lower())
+    if not q:
+        return False
+    has_code_intent = any(term in q for term in ("code", "script", "program", "make", "write", "create", "generate"))
+    has_language = any(term in q for term in ("python", ".py", "javascript", "js", "typescript", "java", "c++", "c#", "go ", "rust"))
+    has_hello = any(term in q for term in ("hello world", "hello, world", "hello-world", "helloworld"))
+    return bool(has_code_intent and (has_language or has_hello))
+
+
+def _unwrap_single_code_fence(text: str) -> str:
+    s = str(text or "").strip()
+    m = re.fullmatch(r"```[a-zA-Z0-9_+.-]*\s*\n?([\s\S]*?)\n?```", s)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
+def _looks_like_code_answer(answer: str) -> bool:
+    s = str(answer or "").strip()
+    if not s:
+        return False
+    code_markers = ("print(", "def ", "class ", "import ", "from ", "if __name__", "console.log", "function ")
+    return any(marker in s for marker in code_markers)
+
+
+def _parse_structured_text_answer(text: str, *, question: str | None = None) -> Dict[str, Any]:
     raw = str(text or "").strip()
     if not raw:
         return {"answer": "", "key_points": [], "sources_used": [], "followups": [], "confidence": "low"}
@@ -70,34 +125,49 @@ def _parse_structured_text_answer(text: str) -> Dict[str, Any]:
     sections = {"answer": [], "key_points": [], "followups": []}
     confidence = "medium"
     current = "answer"
+    saw_heading = False
 
     for line in raw.splitlines():
         stripped = line.strip()
-        upper = stripped.upper()
-        if upper == "ANSWER:" or upper == "ANSWER":
-            current = "answer"
+        if not stripped:
             continue
-        if upper == "KEY POINTS:" or upper == "KEY POINTS":
-            current = "key_points"
-            continue
-        if upper == "FOLLOWUPS:" or upper == "FOLLOWUPS":
-            current = "followups"
-            continue
-        if upper.startswith("CONFIDENCE:"):
-            val = stripped.split(":", 1)[1].strip().lower()
-            if val in {"low", "medium", "high"}:
-                confidence = val
+
+        heading, tail = _heading_kind(stripped)
+        if heading:
+            saw_heading = True
+            if heading == "confidence":
+                val = tail.lower()
+                for candidate in ("low", "medium", "high"):
+                    if candidate in val.split() or val == candidate:
+                        confidence = candidate
+                        break
+                continue
+            current = heading
+            if tail:
+                if current in {"key_points", "followups"}:
+                    cleaned = _strip_list_marker(tail)
+                    if cleaned:
+                        sections[current].append(cleaned)
+                else:
+                    sections["answer"].append(tail)
             continue
 
         if current in {"key_points", "followups"}:
-            cleaned = re.sub(r"^[-*+]|^\d+[.)]", "", stripped).strip()
+            cleaned = _strip_list_marker(stripped)
             if cleaned:
                 sections[current].append(cleaned)
         else:
-            if stripped:
-                sections["answer"].append(stripped)
+            sections["answer"].append(stripped)
 
-    answer = "\n".join(sections["answer"]).strip() or raw
+    answer = "\n".join(sections["answer"]).strip() if saw_heading else raw
+    answer = answer or raw
+
+    if _looks_like_simple_code_question(question):
+        answer = _unwrap_single_code_fence(answer)
+        if _looks_like_code_answer(answer):
+            sections["key_points"] = []
+            sections["followups"] = []
+
     return {
         "answer": answer,
         "key_points": sections["key_points"][:8],
@@ -189,7 +259,7 @@ class DomainQAAAgent(BaseAgent):
         context: Optional[Dict[str, Any]] = None,
         max_peer_consults: int = 0,
     ) -> Dict[str, Any]:
-        backend = str(getattr(self.ctx.llm, "backend", "") or "").strip().lower()
+        backend = str(active_backend() or getattr(self.ctx.llm, "backend", "") or "").strip().lower()
         is_local = backend == "local"
 
         mem_bundle = self.get_memory_bundle(
@@ -201,7 +271,7 @@ class DomainQAAAgent(BaseAgent):
         )
         memory_context = self.format_memory_bundle(mem_bundle)
         if is_local:
-            memory_context = _truncate_text(memory_context, 2500)
+            memory_context = _truncate_text(memory_context, 500)
 
         peer_notes: List[Dict[str, Any]] = []
         if max_peer_consults > 0 and self.ctx.registry is not None:
@@ -256,7 +326,7 @@ class DomainQAAAgent(BaseAgent):
                 temperature=0.0,
                 purpose="qa",
             )
-            out = _parse_structured_text_answer(text_out)
+            out = _parse_structured_text_answer(text_out, question=question)
         else:
             out = await self.ctx.llm.chat_json_async(system=system, messages=messages, temperature=0.2)
             if not isinstance(out, dict):

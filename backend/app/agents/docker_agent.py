@@ -7,6 +7,9 @@ from typing import Any, Dict, List, Optional
 from app.agents.base import BaseAgent
 from app.llm.prompts import DOCKER_PLAN_SYSTEM
 from app.utils.file_utils import list_files
+from app.utils.repetition_guard import sanitize_operations
+from app.utils.local_code_fallbacks import looks_like_known_python_project_request
+from app.utils.nlp_code_planner import is_local_backend
 
 
 def _guess_entry(project_root: Path) -> str:
@@ -22,6 +25,43 @@ def _guess_entry(project_root: Path) -> str:
 class DockerAgent(BaseAgent):
     agent_type = "docker"
 
+    def _default_plan(self, *, entry: str, has_requirements: bool, has_pyproject: bool, reason: str = "") -> Dict[str, Any]:
+        dockerfile = self._default_dockerfile(entry=entry, has_requirements=has_requirements, has_pyproject=has_pyproject)
+        notes = "Adjust CMD/ENTRYPOINT to match your project."
+        if reason:
+            notes = f"{notes} {reason}"
+        return {
+            "summary": "Generated a generic Dockerfile (.dockerignore included).",
+            "operations": [
+                {"op": "write_file", "path": "Dockerfile", "content": dockerfile},
+                {"op": "write_file", "path": ".dockerignore", "content": "__pycache__\n.venv\n.git\nnode_modules\ndist\nbuild\n"},
+            ],
+            "notes": notes,
+            "docker_commands": [],
+        }
+
+    def _default_node_plan(self, *, reason: str = "") -> Dict[str, Any]:
+        notes = "Generated a generic Node.js Dockerfile."
+        if reason:
+            notes = f"{notes} {reason}"
+        return {
+            "summary": "Generated a generic Node.js Dockerfile (.dockerignore included).",
+            "operations": [
+                {"op": "write_file", "path": "Dockerfile", "content": self._default_node_dockerfile()},
+                {"op": "write_file", "path": ".dockerignore", "content": "node_modules\ndist\nbuild\n.git\n.env\n"},
+            ],
+            "notes": notes,
+            "docker_commands": [],
+        }
+
+    def _skip_plan(self, *, reason: str = "") -> Dict[str, Any]:
+        return {
+            "summary": "Docker asset generation skipped.",
+            "operations": [],
+            "notes": reason or "No stable local Docker template matched this project.",
+            "docker_commands": [],
+        }
+
     async def docker_plan(self, *, project_root: Path, user_prompt: str) -> Dict[str, Any]:
         self.set_state("planning")
         self.log("creating docker asset plan")
@@ -31,17 +71,44 @@ class DockerAgent(BaseAgent):
         has_pyproject = (project_root / "pyproject.toml").exists()
         entry = _guess_entry(project_root)
 
-        if not self.llm_available():
-            dockerfile = self._default_dockerfile(entry=entry, has_requirements=has_requirements, has_pyproject=has_pyproject)
-            plan = {
-                "summary": "Generated a generic Dockerfile (.dockerignore included).",
+        # Local coding mode should not call another strict JSON planner for Docker.
+        # The main ModuleAgent already created/edited project files using text
+        # prompts; use stable templates here to avoid code-json-docker loops.
+        if is_local_backend(self.ctx.llm):
+            if py_files or has_requirements or has_pyproject:
+                plan = self._default_plan(
+                    entry=entry,
+                    has_requirements=has_requirements,
+                    has_pyproject=has_pyproject,
+                    reason="Local backend detected; skipped code-json-docker LLM call.",
+                )
+            elif (project_root / "package.json").exists():
+                plan = self._default_node_plan(reason="Local backend detected; skipped code-json-docker LLM call.")
+            else:
+                plan = self._skip_plan(reason="Local backend detected and no Python/Node Docker template matched.")
+            plan["metadata"] = {"local_docker_template": True, "skip_local_json_docker": True}
+            self.latest_result = plan
+            self.remember(json.dumps(plan), tags=["docker", "local_template"], success=None)
+            self.add_type_memory(json.dumps(plan), tags=["docker", "local_template"], success=None)
+            self.set_state("idle")
+            return plan
 
-                "operations": [
-                    {"op": "write_file", "path": "Dockerfile", "content": dockerfile},
-                    {"op": "write_file", "path": ".dockerignore", "content": "__pycache__\n.venv\n.git\n"},
-                ],
-                "notes": "Adjust CMD/ENTRYPOINT to match your project.",
-            }
+        if looks_like_known_python_project_request(user_prompt, project_root=project_root):
+            plan = self._default_plan(
+                entry=entry,
+                has_requirements=has_requirements,
+                has_pyproject=has_pyproject,
+                reason="Simple Python request detected; skipped local code-json-docker LLM call.",
+            )
+            plan["metadata"] = {"deterministic_fallback": True, "fallback_kind": "simple_python_docker"}
+            self.latest_result = plan
+            self.remember(json.dumps(plan), tags=["docker", "deterministic_fallback"], success=None)
+            self.add_type_memory(json.dumps(plan), tags=["docker", "deterministic_fallback"], success=None)
+            self.set_state("idle")
+            return plan
+
+        if not self.llm_available():
+            plan = self._default_plan(entry=entry, has_requirements=has_requirements, has_pyproject=has_pyproject, reason="LLM unavailable.")
             self.latest_result = plan
             self.remember(json.dumps(plan), tags=["docker"], success=None)
             self.set_state("idle")
@@ -83,12 +150,39 @@ class DockerAgent(BaseAgent):
             }
         ]
 
-        plan = await self.ctx.llm.chat_json_async(system=DOCKER_PLAN_SYSTEM, messages=messages, temperature=0.2)
+        try:
+            plan = await self.ctx.llm.chat_json_async(
+                system=DOCKER_PLAN_SYSTEM, messages=messages, temperature=0.2, purpose="code-json-docker"
+            )
+        except Exception as e:
+            plan = self._default_plan(
+                entry=entry,
+                has_requirements=has_requirements,
+                has_pyproject=has_pyproject,
+                reason=f"Local Docker planner failed ({type(e).__name__}); used stable fallback.",
+            )
         if not isinstance(plan, dict):
-            raise ValueError("DockerAgent plan must be JSON object")
+            plan = self._default_plan(
+                entry=entry,
+                has_requirements=has_requirements,
+                has_pyproject=has_pyproject,
+                reason="Docker planner returned a non-object response; used stable fallback.",
+            )
         plan.setdefault("operations", [])
         plan.setdefault("notes", "")
         plan.setdefault("summary", "")
+        plan["operations"], dropped_ops = sanitize_operations(plan.get("operations") or [])
+        if dropped_ops:
+            plan["notes"] = (str(plan.get("notes") or "") + f"\nDropped {dropped_ops} unsafe repeated-token Docker operation(s).").strip()
+
+        if not plan.get("operations") and (py_files or looks_like_known_python_project_request(user_prompt, project_root=project_root)):
+            plan = self._default_plan(
+                entry=entry,
+                has_requirements=has_requirements,
+                has_pyproject=has_pyproject,
+                reason="Docker planner produced no safe operations; used stable fallback.",
+            )
+
         self.latest_result = plan
         self.remember(json.dumps(plan), tags=["docker"], success=None)
         self.add_type_memory(json.dumps(plan), tags=["docker"], success=None)
@@ -111,3 +205,15 @@ class DockerAgent(BaseAgent):
             lines.append("# No requirements.txt found. Add dependency installation steps here.")
         lines.append(f"\nCMD [\"python\", \"{entry}\"]")
         return "\n".join(lines) + "\n"
+
+    def _default_node_dockerfile(self) -> str:
+        return (
+            "FROM node:20-slim\n"
+            "WORKDIR /app\n"
+            "COPY package*.json ./\n"
+            "RUN npm install --omit=dev || npm install\n"
+            "COPY . .\n"
+            "CMD [\"npm\", \"start\"]\n"
+        )
+
+

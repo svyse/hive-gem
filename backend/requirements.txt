@@ -7,9 +7,10 @@ httpx>=0.27.0
 beautifulsoup4>=4.12.0
 
 # LLM backends
-# torch==2.0.0
-# torchvision==0.15.1
-# torchaudio==2.0.1
+# Install CUDA-enabled PyTorch separately in the same backend environment for RTX GPUs.
+# For RTX 3060 / CUDA 12.1 on Windows/Linux, run:
+#   pip install --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Verify with: python ../scripts/check_local_cuda.py
 transformers==4.41.0
 accelerate==0.33.0
 

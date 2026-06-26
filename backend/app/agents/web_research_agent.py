@@ -33,6 +33,50 @@ def _truncate(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "\n...<truncated>...\n"
 
 
+def _active_llm_backend(ctx: Any) -> str:
+    llm = getattr(ctx, "llm", None)
+    return str(getattr(llm, "backend", getattr(settings, "llm_backend", "local")) or "local").lower()
+
+
+def _extractive_summary(query: str, results: List[Dict[str, Any]], docs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build a deterministic summary without calling the LLM.
+
+    Local code mode uses this by default so web research cannot re-enter the
+    fragile local strict-JSON/repeated-token path. The code engine still gets
+    useful titles, snippets, URLs, and small fetched excerpts.
+    """
+    key_points: List[str] = []
+    data: List[Dict[str, str]] = []
+
+    for result in results[:5]:
+        title = str(result.get("title") or "").strip()
+        snippet = str(result.get("snippet") or "").strip()
+        url = str(result.get("url") or "").strip()
+        if title or snippet:
+            point = (title + (f": {snippet}" if snippet else "")).strip()
+            key_points.append(point[:500])
+        if url:
+            data.append({"label": title[:120] or "source", "value": snippet[:300], "source_url": url})
+
+    for doc in docs[:3]:
+        url = str(doc.get("url") or "").strip()
+        text = str(doc.get("text") or "").strip()
+        if not text:
+            continue
+        first_lines = [line.strip() for line in text.splitlines() if line.strip()]
+        excerpt = " ".join(first_lines[:4])[:600]
+        if excerpt:
+            key_points.append(excerpt)
+            data.append({"label": "excerpt", "value": excerpt[:450], "source_url": url})
+
+    return {
+        "key_points": key_points[:8],
+        "data": data[:8],
+        "open_questions": [] if key_points or data else [f"No useful web text was retrieved for: {query}"],
+        "summary_mode": "extractive_no_llm",
+    }
+
+
 class WebResearchAgent(BaseAgent):
     agent_type = "web_research"
 
@@ -119,7 +163,10 @@ class WebResearchAgent(BaseAgent):
             docs = [d for d in fetched if d]
 
         summary: Any = None
-        if self.llm_available() and docs:
+        active_backend = _active_llm_backend(self.ctx)
+        summarize_with_llm = active_backend != "local" or bool(getattr(settings, "local_code_web_research_llm_summary_enabled", False))
+
+        if summarize_with_llm and self.llm_available() and docs:
             try:
                 messages = [
                     {
@@ -133,17 +180,14 @@ class WebResearchAgent(BaseAgent):
                         ),
                     }
                 ]
-                # Run LLM calls in a thread to avoid blocking the FastAPI event loop.
+                # Hosted/cloud backends can summarize research as JSON. Local
+                # code mode avoids this by default to prevent repeated-token JSON
+                # loops from contaminating coding context.
                 summary = await self.ctx.llm.chat_json_async(system=WEB_SUMMARY_SYSTEM, messages=messages, temperature=0.2)
             except Exception as e:
-                summary = {"error": f"LLM summarization failed: {e}"}
+                summary = {"error": f"LLM summarization failed: {e}", **_extractive_summary(query, results, docs)}
         else:
-            # fallback: simple excerpt
-            summary = {
-                "key_points": [],
-                "data": [],
-                "open_questions": ["LLM unavailable or no documents fetched; summary is empty."],
-            }
+            summary = _extractive_summary(query, results, docs)
 
         out = {
             "query": query,

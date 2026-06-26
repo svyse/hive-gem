@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
+import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -10,6 +13,20 @@ from typing import Any, Dict, List, Optional, Tuple
 from app.agents.base import BaseAgent
 from app.core.config import settings
 from app.utils.file_utils import safe_resolve
+from app.utils.repetition_guard import sanitize_operation_content, sanitize_operations
+from app.utils.local_code_fallbacks import (
+    maybe_simple_python_plan_fallback,
+    plan_has_meaningful_operations,
+    plan_looks_like_repetition_noop,
+)
+from app.utils.nlp_code_planner import build_generic_python_scaffold_plan, is_local_backend
+from app.utils.local_code_quality import (
+    build_quality_lesson_payload,
+    filter_operations_for_quality,
+    short_quality_issue_summary,
+    validate_generated_file_content,
+    validate_generated_path_for_prompt,
+)
 from app.utils.sequence_learning import (
     QueryTraceRecorder,
     extract_sequence_traces_from_memories,
@@ -322,7 +339,9 @@ class OrchestratorAgent(BaseAgent):
             self._trace_event("agent_call", agent_type=self.agent_type, method="_build_context")
             context = await self._build_context(project_root=project_root, user_prompt=user_prompt, local_ref_agent=local_ref_agent)
 
-            # 1) Plan changes
+            # 1) Plan changes. All normal local coding requests flow through
+            # ModuleAgent's prompt-driven local code engine rather than
+            # demo-specific hardcoded templates.
             self._trace_event("agent_call", agent_type="module", method="make_plan")
             plan = await module_agent.make_plan(project_root=project_root, user_prompt=user_prompt, context=context)
             await self.ctx.bus.publish("plan", {"plan": plan})
@@ -331,7 +350,19 @@ class OrchestratorAgent(BaseAgent):
 
             # 2) Logic review
             self._trace_event("agent_call", agent_type="logic", method="review_plan")
-            review = await logic_agent.review_plan(project_root=project_root, user_prompt=user_prompt, plan=plan, context=context)
+            try:
+                review = await logic_agent.review_plan(project_root=project_root, user_prompt=user_prompt, plan=plan, context=context)
+            except Exception as e:
+                # Never let a malformed local JSON review crash the code pipeline.
+                # The final safety pass below still sanitizes every operation before writing files.
+                review = {
+                    "approved": True,
+                    "issues": [
+                        f"Logic review failed ({type(e).__name__}: {e}); continuing with sanitized plan operations."
+                    ],
+                    "recommended_plan_patch": {"operations": []},
+                }
+                self.log("Logic review failed; continuing with sanitized plan operations.")
             await self.ctx.bus.publish("logic_review", {"review": review})
             if not review.get("approved", True):
                 self.log("LogicAgent did not approve plan; proceeding but recording issues.")
@@ -346,9 +377,65 @@ class OrchestratorAgent(BaseAgent):
                 plan["operations"] = plan_ops + patch_ops
                 self.log(f"Merged {len(patch_ops)} patch operations into plan.")
 
+            # Final safety pass: never apply repeated-token write_file content.
+            plan_ops_clean, dropped_plan_ops = sanitize_operations(plan.get("operations") or [])
+            plan["operations"] = plan_ops_clean
+            if dropped_plan_ops:
+                self.log(f"Dropped {dropped_plan_ops} unsafe repeated-token operation(s) before apply.")
+
+            # Generic file-quality gate before writing anything. This blocks the
+            # failure mode seen in the attached projects: README prose/shell
+            # commands accepted as .py, tests, requirements.txt, or .gitignore.
+            quality_filtered_ops, pre_apply_quality_issues = filter_operations_for_quality(
+                plan.get("operations") or [],
+                prompt=user_prompt,
+                project_name=project_root.name,
+            )
+            if pre_apply_quality_issues:
+                plan["operations"] = quality_filtered_ops
+                meta = plan.setdefault("metadata", {})
+                if isinstance(meta, dict):
+                    existing = meta.get("quality_issues") if isinstance(meta.get("quality_issues"), list) else []
+                    meta["quality_issues"] = list(existing) + pre_apply_quality_issues[:20]
+                    meta["quality_issues_count"] = len(meta["quality_issues"])
+                summary = short_quality_issue_summary(pre_apply_quality_issues)
+                plan["notes"] = (str(plan.get("notes") or "") + "\nPre-apply quality gate removed invalid generated files: " + summary).strip()
+                self.log("Pre-apply quality gate removed invalid generated files: " + summary)
+
+            fallback_plan = maybe_simple_python_plan_fallback(
+                user_prompt=user_prompt,
+                plan=plan,
+                reason="no safe operations remained after planner/review sanitization",
+                project_root=project_root,
+                extra_signal_text=str(plan.get("notes") or ""),
+            )
+            if fallback_plan is not None:
+                if plan_looks_like_repetition_noop(plan):
+                    self.log("Planner returned repeated-token/no-op output; using deterministic Python fallback.")
+                elif not plan_has_meaningful_operations(plan):
+                    self.log("No safe plan operations remained; using deterministic Python fallback for known request.")
+                plan = fallback_plan
+
+            if is_local_backend(self.ctx.llm) and not plan_has_meaningful_operations(plan):
+                self.log("No safe operations remained for local code pipeline; creating generic prompt-based Python scaffold.")
+                plan = build_generic_python_scaffold_plan(
+                    user_prompt,
+                    reason="orchestrator safety fallback after planning/review sanitization",
+                )
+
             # 4) Execute file operations
+            cleanup_report = self._cleanup_new_project_failed_artifacts(
+                project_root=project_root,
+                user_prompt=user_prompt,
+                plan=plan,
+            )
+            if cleanup_report.get("deleted"):
+                self.log(
+                    "Cleaned failed generated artifacts before create-project apply: "
+                    + ", ".join(cleanup_report.get("deleted", [])[:8])
+                )
             self._trace_event("agent_call", agent_type=self.agent_type, method="_apply_operations")
-            applied = await self._apply_operations(project_root, plan.get("operations") or [], command_agent)
+            applied = await self._apply_operations(project_root, plan.get("operations") or [], command_agent, user_prompt=user_prompt)
             await self.ctx.bus.publish("operations_applied", {"applied": applied})
             self.log(f"Applied operations: {applied['applied_count']}, skipped: {applied['skipped_count']}")
             if applied["errors"]:
@@ -381,6 +468,28 @@ class OrchestratorAgent(BaseAgent):
                         await self.ctx.bus.publish("compile_report", {"compile": compile_report, "deps_fix": deps_fix_compile})
                 except Exception:
                     pass
+
+            # 5b) If compile still fails, let the local code engine edit files once.
+            if not compile_report.get("ok", False):
+                try:
+                    repair_text = self._compile_error_text(compile_report)
+                    repair_result = await self._attempt_local_code_repair(
+                        phase="compile",
+                        project_root=project_root,
+                        user_prompt=user_prompt,
+                        error_text=repair_text,
+                        context=context,
+                        plan=plan,
+                        module_agent=module_agent,
+                        command_agent=command_agent,
+                    )
+                    if (repair_result.get("applied") or {}).get("applied_count", 0) > 0:
+                        compile_report = await compiling_agent.compile_check(project_root=project_root, command_agent=command_agent)
+                        await self.ctx.bus.publish("compile_report", {"compile": compile_report, "repair": repair_result})
+                        if compile_report.get("ok"):
+                            self.log("Compile check passed after local code engine repair.")
+                except Exception as e:
+                    self.log(f"local code engine compile repair failed: {type(e).__name__}: {e}")
 
             # 6) Tests
             self._trace_event("agent_call", agent_type="testing", method="ensure_and_run_tests")
@@ -418,6 +527,34 @@ class OrchestratorAgent(BaseAgent):
                 except Exception:
                     pass
 
+            # 6b) If tests still fail, let the local code engine edit files once and rerun compile/tests.
+            if test_report.get("summary") != "passed":
+                try:
+                    repair_text = self._test_error_text(test_report)
+                    repair_result = await self._attempt_local_code_repair(
+                        phase="tests",
+                        project_root=project_root,
+                        user_prompt=user_prompt,
+                        error_text=repair_text,
+                        context=context,
+                        plan=plan,
+                        module_agent=module_agent,
+                        command_agent=command_agent,
+                    )
+                    if (repair_result.get("applied") or {}).get("applied_count", 0) > 0:
+                        compile_report = await compiling_agent.compile_check(project_root=project_root, command_agent=command_agent)
+                        await self.ctx.bus.publish("compile_report", {"compile": compile_report, "repair": repair_result})
+                        test_report = await testing_agent.ensure_and_run_tests(
+                            project_root=project_root,
+                            user_prompt=user_prompt,
+                            plan=plan,
+                            command_agent=command_agent,
+                        )
+                        await self.ctx.bus.publish("test_report", {"tests": test_report, "repair": repair_result})
+                        self.log(f"Test summary (after local code engine repair): {test_report.get('summary')}")
+                except Exception as e:
+                    self.log(f"local code engine test repair failed: {type(e).__name__}: {e}")
+
             # 7) Project structure assessment
             self._trace_event("agent_call", agent_type="complex_compiling", method="assess_structure")
             structure_report = await struct_agent.assess_structure(project_root=project_root, command_agent=command_agent)
@@ -426,8 +563,12 @@ class OrchestratorAgent(BaseAgent):
             # 8) Docker assets
             self._trace_event("agent_call", agent_type="docker", method="docker_plan")
             docker_plan = await docker_agent.docker_plan(project_root=project_root, user_prompt=user_prompt)
+            docker_ops_clean, dropped_docker_ops = sanitize_operations(docker_plan.get("operations") or [])
+            docker_plan["operations"] = docker_ops_clean
+            if dropped_docker_ops:
+                self.log(f"Dropped {dropped_docker_ops} unsafe repeated-token Docker operation(s) before apply.")
             self._trace_event("agent_call", agent_type=self.agent_type, method="_apply_operations", phase="docker")
-            docker_applied = await self._apply_operations(project_root, docker_plan.get("operations") or [], command_agent)
+            docker_applied = await self._apply_operations(project_root, docker_plan.get("operations") or [], command_agent, user_prompt=user_prompt)
             await self.ctx.bus.publish("docker_plan", {"docker": docker_plan, "applied": docker_applied})
 
             # Optional: execute docker commands if present and allowed
@@ -494,6 +635,21 @@ class OrchestratorAgent(BaseAgent):
                 except Exception:
                     pass
 
+            try:
+                lesson_rec = self._record_code_failure_lesson(
+                    user_prompt=user_prompt,
+                    project_root=project_root,
+                    plan=plan,
+                    applied=applied,
+                    compile_report=compile_report,
+                    test_report=test_report,
+                    success=success_flag,
+                )
+                if lesson_rec.get("recorded"):
+                    self._trace_event("code_generation_lesson", **lesson_rec)
+            except Exception as e:
+                self.log(f"code generation lesson recording skipped: {type(e).__name__}: {e}")
+
             self._trace_event(
                 "query_end",
                 success=success_flag,
@@ -537,6 +693,287 @@ class OrchestratorAgent(BaseAgent):
                     self._trace_event("agent_terminate", agent_type=a.agent_type)
                 except Exception:
                     pass
+
+    def _compile_error_text(self, compile_report: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for e in (compile_report or {}).get("errors", [])[:20]:
+            if not isinstance(e, dict):
+                parts.append(str(e))
+                continue
+            if e.get("file"):
+                parts.append(f"FILE: {e.get('file')}")
+            if e.get("error"):
+                parts.append(str(e.get("error")))
+            if e.get("stderr"):
+                parts.append(str(e.get("stderr")))
+            if e.get("stdout"):
+                parts.append(str(e.get("stdout")))
+        return "\n".join(parts)[-20000:]
+
+    def _test_error_text(self, test_report: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        for r in (test_report or {}).get("results", [])[:20]:
+            if not isinstance(r, dict):
+                parts.append(str(r))
+                continue
+            if r.get("command"):
+                parts.append(f"COMMAND: {r.get('command')}")
+            if r.get("error"):
+                parts.append(str(r.get("error")))
+            if r.get("stderr"):
+                parts.append(str(r.get("stderr")))
+            if r.get("stdout"):
+                parts.append(str(r.get("stdout")))
+        return "\n".join(parts)[-24000:]
+
+    def _cleanup_new_project_failed_artifacts(
+        self,
+        *,
+        project_root: Path,
+        user_prompt: str,
+        plan: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Remove obvious failed local-generation artifacts before a create run.
+
+        This is intentionally conservative.  By default it only runs under a
+        sample_projects folder, where a create-project prompt is expected to own
+        the folder.  It prevents bad files from previous attempts (for example
+        ``python main.py``, ``file_1.java``, invalid ``main.py`` or stale
+        ``__pycache__``) from making every later run fail compile before the new
+        valid files can help.
+        """
+
+        raw_enabled = os.getenv("LOCAL_CODE_ENGINE_CLEAN_NEW_PROJECT_ARTIFACTS", "1").strip().lower()
+        if raw_enabled in {"0", "false", "no", "off"}:
+            return {"deleted": [], "skipped": [], "reason": "disabled"}
+
+        meta = plan.get("metadata") if isinstance(plan, dict) else {}
+        mode = str((meta or {}).get("mode") or "").lower()
+        planner_kind = str((meta or {}).get("planner_kind") or "").lower()
+        q = str(user_prompt or "").strip().lower()
+        looks_create = mode == "create_project" or (
+            any(q.startswith(prefix) for prefix in ("create ", "make ", "build ", "generate ", "write "))
+            and "debug" not in q
+            and "fix" not in q
+        )
+        if not looks_create:
+            return {"deleted": [], "skipped": [], "reason": "not_create_project"}
+
+        parts = {part.lower() for part in project_root.resolve().parts}
+        allow_anywhere = os.getenv("LOCAL_CODE_ENGINE_CLEAN_NEW_PROJECT_ANYWHERE", "0").strip().lower() in {"1", "true", "yes", "on"}
+        if not allow_anywhere and "sample_projects" not in parts:
+            return {"deleted": [], "skipped": [], "reason": "outside_sample_projects"}
+
+        deleted: List[str] = []
+        skipped: List[str] = []
+        protected = {".memory", ".workspace", ".git", ".venv", "venv", "node_modules"}
+
+        def rel_of(path: Path) -> str:
+            return str(path.relative_to(project_root)).replace("\\", "/")
+
+        # Remove cache directories and binary cache artifacts first.
+        for p in sorted(project_root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            try:
+                rel = rel_of(p)
+            except Exception:
+                continue
+            if any(part in protected for part in p.parts):
+                continue
+            try:
+                if p.is_dir() and p.name in {"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}:
+                    shutil.rmtree(p, ignore_errors=True)
+                    deleted.append(rel + "/")
+                elif p.is_file() and p.suffix.lower() in {".pyc", ".pyo", ".pyd"}:
+                    p.unlink(missing_ok=True)
+                    deleted.append(rel)
+            except Exception as exc:
+                skipped.append(f"{rel}: {exc}")
+
+        # Remove files that fail the same generic quality gate used for new
+        # writes.  This clears previous failed generations without hardcoding
+        # calculator/hello-world behavior.
+        for p in sorted(project_root.rglob("*")):
+            if not p.is_file():
+                continue
+            try:
+                rel = rel_of(p)
+            except Exception:
+                continue
+            rel_parts = set(rel.split("/"))
+            if rel_parts & protected or "__pycache__" in rel_parts:
+                continue
+            try:
+                if p.stat().st_size > 300_000:
+                    continue
+                text = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            ok, issues = validate_generated_file_content(rel, text, prompt=user_prompt, project_name=project_root.name)
+            if ok:
+                continue
+            try:
+                p.unlink(missing_ok=True)
+                deleted.append(rel)
+            except Exception as exc:
+                skipped.append(f"{rel}: {exc}; issues={issues[:3]}")
+
+        # Remove empty generated directories left behind after deleting files.
+        for p in sorted([x for x in project_root.rglob("*") if x.is_dir()], key=lambda item: len(item.parts), reverse=True):
+            try:
+                rel = rel_of(p)
+            except Exception:
+                continue
+            if any(part in protected for part in p.parts):
+                continue
+            try:
+                if not any(p.iterdir()):
+                    p.rmdir()
+                    deleted.append(rel + "/")
+            except Exception:
+                pass
+
+        return {"deleted": deleted[:200], "skipped": skipped[:50], "planner_kind": planner_kind, "mode": mode}
+
+    async def _attempt_local_code_repair(
+        self,
+        *,
+        phase: str,
+        project_root: Path,
+        user_prompt: str,
+        error_text: str,
+        context: Dict[str, Any],
+        plan: Dict[str, Any],
+        module_agent,
+        command_agent,
+    ) -> Dict[str, Any]:
+        if not bool(getattr(settings, "local_code_engine_repair_enabled", True)):
+            return {"attempted": False, "reason": "disabled"}
+        if not str(error_text or "").strip():
+            return {"attempted": False, "reason": "no_error_text"}
+
+        self.log(f"attempting local code engine repair after {phase} failure")
+        repair_plan = await module_agent.make_repair_plan(
+            project_root=project_root,
+            user_prompt=user_prompt,
+            error_text=error_text,
+            phase=phase,
+            prior_plan=plan,
+            context=context,
+        )
+        repair_ops, dropped = sanitize_operations(repair_plan.get("operations") or [])
+        repair_plan["operations"] = repair_ops
+        if dropped:
+            self.log(f"Dropped {dropped} unsafe repeated-token repair operation(s) before apply.")
+        repair_ops, repair_quality_issues = filter_operations_for_quality(
+            repair_plan.get("operations") or [],
+            prompt=user_prompt,
+            project_name=project_root.name,
+        )
+        repair_plan["operations"] = repair_ops
+        if repair_quality_issues:
+            meta = repair_plan.setdefault("metadata", {})
+            if isinstance(meta, dict):
+                existing = meta.get("quality_issues") if isinstance(meta.get("quality_issues"), list) else []
+                meta["quality_issues"] = list(existing) + repair_quality_issues[:20]
+                meta["quality_issues_count"] = len(meta["quality_issues"])
+            self.log("Repair quality gate removed invalid generated files: " + short_quality_issue_summary(repair_quality_issues))
+        if not repair_ops:
+            self.log("local code engine repair produced no safe file operations")
+            return {"attempted": True, "applied": {"applied_count": 0, "skipped_count": 0, "errors": []}, "repair_plan": repair_plan}
+
+        applied = await self._apply_operations(project_root, repair_ops, command_agent, user_prompt=user_prompt)
+        await self.ctx.bus.publish("operations_applied", {"phase": f"repair_{phase}", "applied": applied, "repair_plan": repair_plan})
+        self.log(f"Repair operations applied: {applied['applied_count']}, skipped: {applied['skipped_count']}")
+
+        # Keep the final run result/training examples aware of repair edits.
+        plan.setdefault("operations", [])
+        plan["operations"] = (plan.get("operations") or []) + repair_ops
+        if repair_plan.get("test_commands"):
+            plan["test_commands"] = repair_plan.get("test_commands") or plan.get("test_commands") or []
+        return {"attempted": True, "applied": applied, "repair_plan": repair_plan}
+
+    def _record_code_failure_lesson(
+        self,
+        *,
+        user_prompt: str,
+        project_root: Path,
+        plan: Dict[str, Any],
+        applied: Dict[str, Any],
+        compile_report: Dict[str, Any],
+        test_report: Dict[str, Any],
+        success: bool,
+    ) -> Dict[str, Any]:
+        """Store compact negative/quality lessons in .memory for future local runs.
+
+        This does not fine-tune immediately and it does not train on bad file
+        contents. It records what went wrong so the next code-engine prompt can
+        retrieve the lesson from memory, and the trainer can continue to use
+        successful prompt->file examples only.
+        """
+
+        if not bool(getattr(settings, "local_code_learning_lessons_enabled", True)):
+            return {"recorded": False, "reason": "disabled"}
+
+        meta = plan.get("metadata") if isinstance(plan, dict) else {}
+        quality_issues = []
+        if isinstance(meta, dict) and isinstance(meta.get("quality_issues"), list):
+            quality_issues = list(meta.get("quality_issues") or [])
+
+        compile_ok = bool((compile_report or {}).get("ok", False))
+        tests_passed = (test_report or {}).get("summary") == "passed"
+        applied_errors = (applied or {}).get("errors") or []
+        should_record = bool(quality_issues or applied_errors or not compile_ok or not tests_passed or not success)
+        if not should_record:
+            return {"recorded": False, "reason": "no_failure_or_quality_issue"}
+
+        compile_summary = self._compile_error_text(compile_report) if not compile_ok else "compile passed"
+        test_summary = self._test_error_text(test_report) if not tests_passed else "tests passed"
+        if applied_errors:
+            quality_issues.append({"path": "[apply_operations]", "issues": [str(applied_errors)[:1200]]})
+
+        payload = build_quality_lesson_payload(
+            prompt=user_prompt,
+            project_name=project_root.name,
+            quality_issues=quality_issues,
+            compile_summary=compile_summary,
+            test_summary=test_summary,
+        )
+        payload.update(
+            {
+                "success": bool(success),
+                "compile_ok": compile_ok,
+                "tests_summary": (test_report or {}).get("summary"),
+                "plan_summary": str((plan or {}).get("summary") or "")[:1200],
+                "plan_notes": str((plan or {}).get("notes") or "")[:2000],
+            }
+        )
+
+        # Add explicit general lessons for validation failures even if the quality
+        # issue list is empty but compile/tests failed.
+        if not payload.get("lessons"):
+            lessons: List[str] = []
+            if not compile_ok:
+                lessons.append("Generated source files must pass syntax/compile checks before being considered complete.")
+            if not tests_passed:
+                lessons.append("Generated projects should include safe non-interactive tests or smoke checks that validate the requested behavior.")
+            payload["lessons"] = lessons
+
+        content = json.dumps(payload, ensure_ascii=False)[: int(getattr(settings, "local_code_failure_max_chars", 12000) or 12000)]
+        tags = ["code_generation_lesson", "local_code_engine", "negative_example", "code_pipeline"]
+        recorded = 0
+        try:
+            self.add_type_memory(content, tags=tags, success=False)
+            recorded += 1
+        except Exception:
+            pass
+        try:
+            self.add_hive_memory(content, tags=tags, success=False)
+            recorded += 1
+        except Exception:
+            pass
+        if recorded:
+            self.log("Recorded code-generation lesson for future local runs.")
+        return {"recorded": bool(recorded), "records": recorded, "quality_issues": len(quality_issues)}
 
     def _record_code_training_examples(self, *, user_prompt: str, operations: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Persist prompt->file-content examples from successful runs.
@@ -603,15 +1040,35 @@ class OrchestratorAgent(BaseAgent):
         self.set_state("gathering_context")
         self.log("gathering context")
 
-        # Orchestrator has access to *all* memories.
-        memory_relevant = self.ctx.memory_store.search_all(query=user_prompt, limit=25, scopes=["hive", "type", "agent"])
-        self._trace_event("memory_access", op="search_all", scope="hive,type,agent", query=user_prompt, limit=25, result_count=len(memory_relevant))
+        query = user_prompt.strip().lower()
+        simple_request = len(query.split()) <= 15
 
-        memory_recent = self.ctx.memory_store.recent_all(limit=15, scopes=["hive", "type", "agent"])
-        self._trace_event("memory_access", op="recent_all", scope="hive,type,agent", limit=15, result_count=len(memory_recent))
+        # Orchestrator has access to all memories. Even for short prompts, keep
+        # code-generation lessons in context so the local assistant can learn
+        # from previous mistakes instead of repeating them.
+        memory_query = ("code_generation_lesson local_code_engine quality_gate " + user_prompt).strip()
+        memory_relevant = self.ctx.memory_store.search_all(
+            query=memory_query,
+            limit=6 if simple_request else 8,
+            scopes=["hive", "type", "agent"],
+        )
+        self._trace_event(
+            "memory_access",
+            op="search_all",
+            scope="hive,type,agent",
+            query=memory_query,
+            limit=6 if simple_request else 8,
+            result_count=len(memory_relevant),
+        )
 
+        memory_recent = self.ctx.memory_store.recent_all(limit=3 if simple_request else 5, scopes=["hive", "type", "agent"])
+        self._trace_event("memory_access", op="recent_all", scope="hive,type,agent", limit=3 if simple_request else 5, result_count=len(memory_recent))
+
+        # Do not return early for short prompts. Most local-code prompts are
+        # short (for example, "create a calculator"), and those are exactly the
+        # runs that need memory lessons and optional web research context.
         local_refs: Dict[str, Any] | None = None
-        if local_ref_agent is not None:
+        if (not simple_request) and local_ref_agent is not None:
             try:
                 self._trace_event("agent_call", agent_type="local_reference", method="find_references")
                 local_refs = await local_ref_agent.find_references(query=user_prompt, project_root=project_root)
@@ -619,9 +1076,14 @@ class OrchestratorAgent(BaseAgent):
                 local_refs = {"error": str(e)}
 
         self._trace_event("agent_call", agent_type=self.agent_type, method="_collect_web_research")
-        web_research = await self._collect_web_research(project_root=project_root, user_prompt=user_prompt)
+        try:
+            web_research = await self._collect_web_research(project_root=project_root, user_prompt=user_prompt)
+        except Exception as e:
+            # Optional context: never let network/search failures stop local code generation.
+            web_research = {"enabled": False, "error": str(e), "queries": [], "items": [], "sources": []}
+            self.log(f"web research skipped/failed: {type(e).__name__}: {e}")
 
-        seq_ctx = self._sequence_learning_context(user_prompt=user_prompt)
+        seq_ctx = {} #self._sequence_learning_context(user_prompt=user_prompt)
 
         rag_context: Dict[str, Any] | None = None
         try:
@@ -688,11 +1150,17 @@ class OrchestratorAgent(BaseAgent):
 
         queries = await self._generate_web_queries(project_root=project_root, user_prompt=user_prompt)
         queries = _uniq(queries)
+        if active_backend == "local":
+            try:
+                max_queries = max(1, int(getattr(settings, "local_code_web_research_max_queries", 3)))
+            except Exception:
+                max_queries = 3
+            queries = queries[:max_queries]
 
         if not queries:
             return {"enabled": True, "queries": [], "items": [], "sources": []}
 
-        self._trace_event("web_research", queries_count=len(queries))
+        self._trace_event("web_research", queries_count=len(queries), backend=active_backend)
 
         # If query count is high, try to shard to sub-orchestrators (self-scaling).
         items: List[Dict[str, Any]] = []
@@ -732,7 +1200,14 @@ class OrchestratorAgent(BaseAgent):
 
             else:
                 self.log(f"web research: {len(queries)} queries (no scaling)")
-                part = await self.assist_web_research(project_root=project_root, queries=queries)
+                timeout_s = float(getattr(settings, "local_code_web_research_timeout_s", 25.0)) if active_backend == "local" else float(getattr(settings, "resource_call_timeout_s", 25.0))
+                try:
+                    part = await asyncio.wait_for(
+                        self.assist_web_research(project_root=project_root, queries=queries),
+                        timeout=max(3.0, timeout_s),
+                    )
+                except asyncio.TimeoutError:
+                    return {"enabled": False, "error": "web_research_timeout", "queries": queries, "items": [], "sources": []}
                 items = part.get("items") or []
         finally:
             # ensure assistant orchestrators get terminated
@@ -753,10 +1228,64 @@ class OrchestratorAgent(BaseAgent):
 
         return {"enabled": True, "queries": queries, "items": items, "sources": sources[:25]}
 
+    def _fallback_code_web_queries(self, *, project_root: Path, user_prompt: str) -> List[str]:
+        """Deterministic web queries for local code mode.
+
+        Local models in this project have produced malformed JSON and repeated
+        token loops, so local-code web-query generation deliberately avoids an
+        LLM call. These queries are prompt-shaped and bias toward docs/examples.
+        """
+        q = re.sub(r"\s+", " ", str(user_prompt or "").strip())
+        q_short = q[:160]
+        lower = f"{project_root.name} {q}".lower()
+
+        language = "python"
+        if any(x in lower for x in ("react", "vite", "tsx", "typescript")):
+            language = "typescript react"
+        elif any(x in lower for x in ("javascript", "node", "express", "npm", "html", "css", "website", "web app")):
+            language = "javascript"
+        elif any(x in lower for x in ("fastapi", "flask", "django", "pytest", "unittest", "python", "_py")):
+            language = "python"
+        elif any(x in lower for x in ("java", "spring")):
+            language = "java"
+        elif "rust" in lower:
+            language = "rust"
+        elif re.search(r"(?:^|\W)go(?:\W|$)|golang", lower):
+            language = "go"
+
+        queries: List[str] = []
+        if q_short:
+            queries.append(f"{language} official docs example {q_short}")
+            queries.append(f"{language} project structure tests best practices {q_short}")
+
+        # Add framework-specific official-docs queries when the prompt names one.
+        framework_queries = [
+            ("fastapi", "FastAPI official docs tutorial project structure testing"),
+            ("flask", "Flask official docs tutorial testing application structure"),
+            ("django", "Django official docs tutorial testing project layout"),
+            ("react", "React official docs forms components Vite project structure"),
+            ("vite", "Vite official docs create project React TypeScript"),
+            ("express", "Express official docs routing middleware testing"),
+            ("pytest", "pytest official docs getting started tests"),
+            ("unittest", "Python unittest official docs examples"),
+        ]
+        for key, query in framework_queries:
+            if key in lower:
+                queries.insert(0, query)
+
+        if not queries:
+            queries.append(f"{language} official documentation examples")
+        return queries
+
     async def _generate_web_queries(self, *, project_root: Path, user_prompt: str) -> List[str]:
-        # If we cannot call the LLM, use the raw prompt as a single search query.
+        llm_client = getattr(getattr(self, "ctx", None), "llm", None)
+        active_backend = str(getattr(llm_client, "backend", getattr(settings, "llm_backend", "local")) or "local").lower()
+        if active_backend == "local":
+            return self._fallback_code_web_queries(project_root=project_root, user_prompt=user_prompt)
+
+        # If we cannot call a hosted LLM, use deterministic prompt-shaped queries.
         if not self.llm_available():
-            return [user_prompt]
+            return self._fallback_code_web_queries(project_root=project_root, user_prompt=user_prompt)
 
         messages = [
             {
@@ -786,8 +1315,8 @@ class OrchestratorAgent(BaseAgent):
                 if isinstance(qs, list):
                     return [str(x) for x in qs if str(x).strip()]
         except Exception as e:
-            self.log(f"web query generation failed; falling back to prompt: {e}")
-        return [user_prompt]
+            self.log(f"web query generation failed; using deterministic code queries: {e}")
+        return self._fallback_code_web_queries(project_root=project_root, user_prompt=user_prompt)
 
     async def assist_web_research(self, *, project_root: Path, queries: List[str]) -> Dict[str, Any]:
         """An orchestrator 'worker mode' that only runs web research queries.
@@ -834,21 +1363,37 @@ class OrchestratorAgent(BaseAgent):
                     pass
             self.set_state("idle")
 
-    async def _apply_operations(self, project_root: Path, operations: List[Dict[str, Any]], command_agent) -> Dict[str, Any]:
+    async def _apply_operations(
+        self,
+        project_root: Path,
+        operations: List[Dict[str, Any]],
+        command_agent,
+        *,
+        user_prompt: str = "",
+    ) -> Dict[str, Any]:
         applied = 0
         skipped = 0
         errors: List[Dict[str, Any]] = []
+        project_name = project_root.name
 
         for op in operations:
             try:
+                if not isinstance(op, dict):
+                    skipped += 1
+                    continue
                 kind = op.get("op")
-                path = op.get("path")
+                path = str(op.get("path") or "")
                 if not kind or not path:
                     skipped += 1
                     continue
 
-                # Validate path is within root
+                # Validate path is within root and is not a hallucinated command/cache path.
                 _ = safe_resolve(project_root, path)
+                ok_path, path_issues = validate_generated_path_for_prompt(path, prompt=user_prompt, project_name=project_name)
+                if not ok_path:
+                    skipped += 1
+                    errors.append({"op": {"op": kind, "path": path}, "error": "unsafe generated path: " + "; ".join(path_issues[:5])})
+                    continue
 
                 if kind == "mkdir":
                     command_agent.mkdir(project_root, path)
@@ -857,6 +1402,12 @@ class OrchestratorAgent(BaseAgent):
                     content = op.get("content")
                     if not isinstance(content, str):
                         raise ValueError("write_file requires string content")
+                    content = sanitize_operation_content(content)
+                    ok_file, file_issues = validate_generated_file_content(path, content, prompt=user_prompt, project_name=project_name)
+                    if not ok_file:
+                        skipped += 1
+                        errors.append({"op": {"op": kind, "path": path}, "error": "unsafe generated file content: " + "; ".join(file_issues[:5])})
+                        continue
                     command_agent.write_file(project_root, path, content)
                     applied += 1
                 elif kind == "delete_file":

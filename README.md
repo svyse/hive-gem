@@ -16,8 +16,6 @@ This fork adds:
 
 ---
 
-Create a project hello_py, the project prompts the user for their name and then responds with "Greetings" and the name provided. The entire project has to run in a jupyter notebook, set up the ipykernel and venv accordingly
-
 ## What changed in this version
 
 ### ✅ Local Transformers LLM (default)
@@ -100,8 +98,6 @@ cp .env.example .env
 # Edit .env if you want to change the local model, enable training, etc.
 
 uvicorn app.main:app --host localhost --port 8000 --reload --host 0.0.0.0 
-
-
 pip install torch==2.0.0+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
 pip install torchvision==0.15.0+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
 ```
